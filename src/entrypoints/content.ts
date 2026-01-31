@@ -1,19 +1,7 @@
-import {
-  scanPage,
-  scanPageContent,
-  clickElementById,
-  setInputValue,
-  checkboxToggle,
-  setSelectValue,
-  highlightElement,
-} from '../utils/dom-scanner';
-import { bindingManager, type PendingChange } from '../utils/binding-manager';
+import { scanPage, scanPageContent, highlightElement, getElementLabel } from '../utils/dom-scanner';
 import { ElementTracker, type TrackedElement } from '../utils/element-tracker';
-import type {
-  ContentToSidepanelMessage,
-  SidepanelToContentMessage,
-} from '../utils/reactive-messages';
 import type { ScannedAction } from '../utils/dom-scanner';
+import { scanLandmarks, type ScannedLandmark } from '../utils/landmark-scanner';
 import { markAllText, removeMarks } from '../utils/tooltip-injector';
 
 // ============================================================================
@@ -23,8 +11,8 @@ import { markAllText, removeMarks } from '../utils/tooltip-injector';
 // ElementTracker instance (fingerprint-based, survives DOM destruction)
 let tracker: ElementTracker | null = null;
 
-// Store pending changes for later processing (bindingManager)
-const pendingChanges = new Map<string, PendingChange>();
+// Track which elements have input listeners attached
+const inputListeners = new WeakMap<HTMLElement, boolean>();
 
 // ============================================================================
 // HELPERS
@@ -33,15 +21,8 @@ const pendingChanges = new Map<string, PendingChange>();
 /**
  * Send a message to the sidepanel/background
  */
-function sendMessage(message: ContentToSidepanelMessage) {
-  browser.runtime.sendMessage(message).catch(() => {});
-}
-
-/**
- * Notify sidebar that the page has been updated (ElementTracker).
- */
-function notifyPageUpdated() {
-  browser.runtime.sendMessage({ type: 'PAGE_UPDATED' }).catch(() => {
+function sendMessage(message: Record<string, unknown>) {
+  browser.runtime.sendMessage(message).catch(() => {
     // Side panel or background may not be listening
   });
 }
@@ -59,105 +40,148 @@ function trackedToActions(tracked: TrackedElement[]): ScannedAction[] {
     }));
 }
 
-// ============================================================================
-// BINDING MANAGER INTEGRATION (teammates' approach)
-// ============================================================================
+/**
+ * Get the current state of an input element
+ */
+function getInputState(element: HTMLElement): Record<string, unknown> {
+  const tag = element.tagName.toLowerCase();
+  const state: Record<string, unknown> = {
+    label: getElementLabel(element),
+    disabled: (element as HTMLButtonElement).disabled ?? false,
+    visible: element.offsetParent !== null,
+  };
+
+  if (tag === 'input') {
+    const input = element as HTMLInputElement;
+    if (input.type === 'checkbox' || input.type === 'radio') {
+      state.checked = input.checked;
+      // For radio buttons, include the group name
+      if (input.type === 'radio' && input.name) {
+        state.radioGroup = input.name;
+      }
+    } else {
+      state.value = input.value;
+    }
+  } else if (tag === 'textarea') {
+    state.value = (element as HTMLTextAreaElement).value;
+  } else if (tag === 'select') {
+    const select = element as HTMLSelectElement;
+    state.value = select.value;
+    state.selectedIndex = select.selectedIndex;
+    state.options = Array.from(select.options).map((opt) => ({
+      value: opt.value,
+      label: opt.text,
+      selected: opt.selected,
+    }));
+  }
+
+  return state;
+}
 
 /**
- * Initialize reactive tracking with binding manager (polling-based).
- * Uses data-acc-id attributes for element identification.
+ * Attach input listeners to a tracked element for real-time sync
  */
-function initBindingManagerTracking(actions: ScannedAction[]) {
-  // Clear any existing bindings
-  bindingManager.clearBindings();
-  pendingChanges.clear();
+function attachInputListeners(element: HTMLElement, id: string) {
+  if (inputListeners.has(element)) return;
 
-  // Initialize callbacks
-  bindingManager.init({
-    onStatePatch: (patch) => {
-      sendMessage({
-        type: 'STATE_PATCH',
-        id: patch.id,
-        changes: patch.changes,
-      });
-    },
+  const tag = element.tagName.toLowerCase();
+  if (!['input', 'textarea', 'select'].includes(tag)) return;
 
-    onElementRemoved: (id) => {
-      sendMessage({
-        type: 'ELEMENT_REMOVED',
-        id,
-      });
-    },
+  const handleInput = () => {
+    const state = getInputState(element);
+    sendMessage({
+      type: 'STATE_PATCH',
+      id,
+      changes: state,
+    });
+  };
 
-    onMinorAddition: (elements) => {
-      sendMessage({
-        type: 'MINOR_ADDITION',
-        elements,
-      });
-    },
+  // Listen for both input (real-time) and change (on blur) events
+  element.addEventListener('input', handleInput);
+  element.addEventListener('change', handleInput);
 
-    onPendingChange: (change) => {
-      pendingChanges.set(change.id, change);
-
-      sendMessage({
-        type: 'PENDING_CHANGE',
-        change,
-      });
-    },
-
-    onInitialState: (states) => {
-      // Send initial state for all elements so UI can sync current values
-      sendMessage({
-        type: 'INITIAL_STATE',
-        states: Object.fromEntries(states),
-      });
-    },
-  });
-
-  // Create bindings from initial scan
-  bindingManager.createBindingsFromScan(actions);
-
-  // Start tracking
-  bindingManager.start();
+  inputListeners.set(element, true);
 }
 
-function describeSubtree(change: PendingChange): string {
-  if (change.classification.type !== 'new-context') {
-    return '';
+/**
+ * Attach listeners to all tracked input elements
+ */
+function attachAllInputListeners() {
+  if (!tracker) return;
+
+  for (const tracked of tracker.getTrackedElements()) {
+    if (tracked.status === 'lost') continue;
+    const element = tracker.getElementById(tracked.fingerprint.id);
+    if (element) {
+      attachInputListeners(element, tracked.fingerprint.id);
+    }
+  }
+}
+
+/**
+ * Get nearby text context for an element (for LLM evaluation)
+ */
+function getNearbyTextContext(element: HTMLElement): string {
+  const parts: string[] = [];
+
+  // Previous sibling text
+  const prev = element.previousElementSibling;
+  if (prev?.textContent) {
+    parts.push(prev.textContent.trim().slice(0, 100));
   }
 
-  const subtree = change.classification.subtree;
-  const elements = change.classification.elements;
+  // Parent text (excluding this element)
+  const parent = element.parentElement;
+  if (parent) {
+    const clone = parent.cloneNode(true) as HTMLElement;
+    // Remove the target element from clone
+    const selfInClone = clone.querySelector(
+      `[data-klaro-id="${element.getAttribute('data-klaro-id')}"]`
+    );
+    if (selfInClone) selfInClone.remove();
 
-  // Build a description of the subtree
-  const lines: string[] = [];
-
-  // Get the role/tag of the root
-  const tag = subtree.tagName?.toLowerCase() || 'div';
-  const role = subtree.getAttribute('role');
-  const ariaLabel = subtree.getAttribute('aria-label');
-
-  lines.push(`New UI Context: ${role || tag}${ariaLabel ? ` (${ariaLabel})` : ''}`);
-  lines.push('');
-
-  // Get visible text content (limited)
-  const textContent = subtree.textContent?.trim().slice(0, 500) || '';
-  if (textContent) {
-    lines.push(`Content preview: ${textContent}`);
-    lines.push('');
+    const parentText = clone.textContent?.trim().slice(0, 100);
+    if (parentText) parts.push(parentText);
   }
 
-  // List interactive elements
-  lines.push('Interactive elements:');
-  for (const el of elements) {
-    lines.push(`- [${el.tag}] ${el.text || '(no label)'} (id: ${el.id})`);
+  // Next sibling text
+  const next = element.nextElementSibling;
+  if (next?.textContent) {
+    parts.push(next.textContent.trim().slice(0, 100));
   }
 
-  return lines.join('\n');
+  return parts.join(' ');
+}
+
+/**
+ * Send initial state for all tracked input elements
+ */
+function sendInitialStates() {
+  if (!tracker) return;
+
+  const states: Record<string, Record<string, unknown>> = {};
+
+  for (const tracked of tracker.getTrackedElements()) {
+    if (tracked.status === 'lost') continue;
+    const element = tracker.getElementById(tracked.fingerprint.id);
+    if (element) {
+      const tag = element.tagName.toLowerCase();
+      if (['input', 'textarea', 'select'].includes(tag)) {
+        states[tracked.fingerprint.id] = getInputState(element);
+      }
+    }
+  }
+
+  if (Object.keys(states).length > 0) {
+    sendMessage({
+      type: 'INITIAL_STATE',
+      states,
+    });
+  }
 }
 
 // ============================================================================
-// ELEMENT TRACKER INTEGRATION (fingerprint-based)
+// ELEMENT TRACKER INITIALIZATION
 // ============================================================================
 
 /**
@@ -185,29 +209,57 @@ async function initElementTracker() {
     debugMode: false,
   });
 
-  // Listen for element updates and notify sidebar
+  // When elements are updated, notify sidebar and attach listeners
   tracker.on('elements-updated', () => {
-    notifyPageUpdated();
+    sendMessage({ type: 'PAGE_UPDATED' });
+    attachAllInputListeners();
+  });
+
+  // When a new element is found, notify sidebar with fingerprint for LLM evaluation
+  tracker.on('element-found', (event) => {
+    const element = (event as CustomEvent).detail.element;
+    const fingerprint = (event as CustomEvent).detail.fingerprint;
+    attachInputListeners(element, fingerprint.id);
+
+    // Get nearby text context for LLM evaluation
+    const nearbyText = getNearbyTextContext(element);
+
+    sendMessage({
+      type: 'ELEMENT_FOUND',
+      fingerprint,
+      nearbyText,
+    });
+  });
+
+  // When an element is re-matched, re-attach listeners and update sidebar
+  tracker.on('element-matched', (event) => {
+    const element = (event as CustomEvent).detail.element;
+    const fingerprint = (event as CustomEvent).detail.fingerprint;
+    const confidence = (event as CustomEvent).detail.confidence;
+    attachInputListeners(element, fingerprint.id);
+
+    // Notify sidebar of the re-match (text may have changed)
+    sendMessage({
+      type: 'ELEMENT_MATCHED',
+      fingerprint,
+      confidence,
+    });
+  });
+
+  // When an element is lost, notify sidebar
+  tracker.on('element-lost', (event) => {
+    const fingerprint = (event as CustomEvent).detail.fingerprint;
+    sendMessage({
+      type: 'ELEMENT_REMOVED',
+      id: fingerprint.id,
+    });
   });
 
   // Start tracking
   await tracker.start();
-}
 
-/**
- * Try to find element by ID using both systems:
- * 1. First try ElementTracker (fingerprint-based)
- * 2. Fall back to data-acc-id query (legacy)
- */
-function findElementById(id: string): HTMLElement | null {
-  // Try ElementTracker first
-  if (tracker) {
-    const el = tracker.getElementById(id);
-    if (el) return el;
-  }
-
-  // Fall back to data-acc-id query
-  return document.querySelector<HTMLElement>(`[data-acc-id="${id}"]`);
+  // Attach listeners to existing elements
+  attachAllInputListeners();
 }
 
 // ============================================================================
@@ -217,7 +269,8 @@ function findElementById(id: string): HTMLElement | null {
 export default defineContentScript({
   matches: ['<all_urls>'],
   async main() {
-    // Initialize ElementTracker
+    // Initialize ElementTracker (waits for body)
+    // Note: Event listener tracking is injected by background.ts via chrome.scripting.executeScript
     await initElementTracker();
 
     // Mark all text blocks after page loads (tooltip feature)
@@ -231,15 +284,21 @@ export default defineContentScript({
     // Handle messages from sidepanel
     browser.runtime.onMessage.addListener(
       (
-        message: SidepanelToContentMessage | { type: string; id?: string; value?: string; checked?: boolean; enabled?: boolean; actions?: ScannedAction[] },
+        message: {
+          type: string;
+          id?: string;
+          value?: string;
+          checked?: boolean;
+          enabled?: boolean;
+        },
         _sender: unknown,
-        sendResponse: (r: unknown) => void,
+        sendResponse: (r: unknown) => void
       ) => {
         // ===== PAGE SCANNING =====
 
+        // Legacy scan (with data-acc-id) - kept for backwards compatibility
         if (message.type === 'SCAN_PAGE') {
           try {
-            // Use legacy scanPage which includes actions with data-acc-id
             const result = scanPage();
             sendResponse(result);
           } catch (e) {
@@ -254,16 +313,17 @@ export default defineContentScript({
           return;
         }
 
-        // Scan with ElementTracker (fingerprint-based IDs)
+        // Fingerprint-based scan (stable IDs that survive DOM destruction)
         if (message.type === 'SCAN_PAGE_TRACKED') {
           try {
             // Get page content (article, headings, pageCopy) from dom-scanner
             const content = scanPageContent();
 
             // Get tracked actions from ElementTracker
-            const actions = tracker
-              ? trackedToActions(tracker.getTrackedElements())
-              : [];
+            const actions = tracker ? trackedToActions(tracker.getTrackedElements()) : [];
+
+            // Send initial states for form elements
+            setTimeout(() => sendInitialStates(), 100);
 
             sendResponse({
               ...content,
@@ -281,116 +341,127 @@ export default defineContentScript({
           return;
         }
 
+        // Landmark-based scan (new architecture: content organized by landmarks)
+        if (message.type === 'SCAN_LANDMARKS') {
+          try {
+            // Get tracked elements from ElementTracker
+            const trackedElements = tracker?.getTrackedElements() || [];
+            const trackedMap = new Map(
+              trackedElements.filter((t) => t.status !== 'lost').map((t) => [t.fingerprint.id, t])
+            );
+
+            // Scan the REAL DOM for landmarks (not a clone, so element refs match)
+            // The scanner will skip boilerplate elements internally
+            const landmarks = scanLandmarks(document.body, trackedMap);
+
+            // Convert to serializable format (remove element references)
+            const serializableLandmarks = landmarks.map((l) => ({
+              id: l.id,
+              type: l.type,
+              rawTitle: l.rawTitle,
+              blocks: l.blocks.map((b) => {
+                if (b.type === 'element') {
+                  // Keep fingerprint but make it serializable
+                  return {
+                    type: 'element' as const,
+                    elementId: b.elementId,
+                    fingerprint: b.fingerprint,
+                  };
+                }
+                return b;
+              }),
+            }));
+
+            // Send initial states for form elements
+            setTimeout(() => sendInitialStates(), 100);
+
+            sendResponse({
+              url: window.location.href,
+              title: document.title,
+              landmarks: serializableLandmarks,
+            });
+          } catch (e) {
+            console.error('[Klaro] SCAN_LANDMARKS error:', e);
+            sendResponse({
+              url: window.location.href,
+              title: document.title,
+              landmarks: [],
+              error: e instanceof Error ? e.message : 'Scan failed',
+            });
+          }
+          return;
+        }
+
         // ===== ELEMENT INTERACTIONS =====
 
-        if (message.type === 'CLICK_ELEMENT' && 'id' in message && message.id) {
-          // Try ElementTracker first (async click with visual feedback)
-          if (tracker) {
-            tracker.clickElement(message.id).then((result) => {
-              if (result.success) {
-                sendResponse({ ok: true, ...result });
-              } else {
-                // Fall back to legacy click
-                const ok = clickElementById(message.id!);
-                sendResponse({ ok });
-              }
-            });
-            return true; // Keep channel open for async response
-          }
+        if (message.type === 'CLICK_ELEMENT' && message.id) {
+          const element = tracker?.getElementById(message.id);
 
-          // Fall back to legacy click
-          const ok = clickElementById(message.id);
-          sendResponse({ ok });
-          return;
-        }
-
-        if (message.type === 'SET_INPUT_VALUE' && 'id' in message && message.id && 'value' in message && message.value !== undefined) {
-          // Try to find element with both systems
-          const el = findElementById(message.id) as HTMLInputElement | HTMLTextAreaElement | null;
-          if (el) {
-            el.focus();
-            el.value = message.value;
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            highlightElement(el);
+          if (element) {
+            element.click();
+            if (typeof element.focus === 'function') element.focus();
+            highlightElement(element);
             sendResponse({ ok: true });
           } else {
-            // Legacy fallback
-            const ok = setInputValue(message.id, message.value);
-            sendResponse({ ok });
+            sendResponse({ ok: false, error: 'Element not found' });
           }
           return;
         }
 
-        if (message.type === 'TOGGLE_CHECKBOX' && 'id' in message && message.id) {
-          // Try to find element with both systems
-          const el = findElementById(message.id) as HTMLInputElement | null;
-          if (el) {
-            if ('checked' in message && message.checked !== undefined) {
-              el.checked = message.checked;
+        if (message.type === 'SET_INPUT_VALUE' && message.id && message.value !== undefined) {
+          const element = tracker?.getElementById(message.id) as
+            | HTMLInputElement
+            | HTMLTextAreaElement
+            | null;
+
+          if (element) {
+            element.focus();
+            element.value = message.value;
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            highlightElement(element);
+            sendResponse({ ok: true });
+          } else {
+            sendResponse({ ok: false, error: 'Element not found' });
+          }
+          return;
+        }
+
+        if (message.type === 'TOGGLE_CHECKBOX' && message.id) {
+          const element = tracker?.getElementById(message.id) as HTMLInputElement | null;
+
+          if (element) {
+            if (message.checked !== undefined) {
+              element.checked = message.checked;
             } else {
-              el.checked = !el.checked;
+              element.checked = !element.checked;
             }
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            highlightElement(el);
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            highlightElement(element);
             sendResponse({ ok: true });
           } else {
-            // Legacy fallback
-            const ok = checkboxToggle(message.id, 'checked' in message ? message.checked : undefined);
-            sendResponse({ ok });
+            sendResponse({ ok: false, error: 'Element not found' });
           }
           return;
         }
 
-        if (message.type === 'SET_SELECT_VALUE' && 'id' in message && message.id && 'value' in message) {
-          // Try to find element with both systems
-          const el = findElementById(message.id) as HTMLSelectElement | null;
-          if (el) {
-            el.value = message.value as string;
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            highlightElement(el);
+        if (message.type === 'SET_SELECT_VALUE' && message.id && message.value !== undefined) {
+          const element = tracker?.getElementById(message.id) as HTMLSelectElement | null;
+
+          if (element) {
+            element.value = message.value;
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            highlightElement(element);
             sendResponse({ ok: true });
           } else {
-            // Legacy fallback
-            const ok = setSelectValue(message.id, message.value as string);
-            sendResponse({ ok });
+            sendResponse({ ok: false, error: 'Element not found' });
           }
           return;
         }
 
-        // ===== BINDING MANAGER TRACKING (legacy) =====
-
-        if (message.type === 'START_TRACKING') {
-          const msg = message as { type: 'START_TRACKING'; actions: ScannedAction[] };
-          initBindingManagerTracking(msg.actions);
-          sendResponse({ ok: true });
-          return;
-        }
-
-        if (message.type === 'STOP_TRACKING') {
-          bindingManager.stop();
-          bindingManager.clearBindings();
-          pendingChanges.clear();
-          sendResponse({ ok: true });
-          return;
-        }
-
-        if (message.type === 'GET_SUBTREE_DESCRIPTION') {
-          const change = pendingChanges.get(message.changeId as string);
-          sendResponse(change ? {
-            description: describeSubtree(change),
-            elements: change.classification.type === 'new-context' ? change.classification.elements : []
-          } : { description: '', elements: [] });
-          return;
-        }
-
-        if (message.type === 'DISMISS_CHANGE') {
-          pendingChanges.delete(message.changeId as string);
-          sendResponse({ ok: true });
-          return;
-        }
+        // ===== TOOLTIP MANAGEMENT =====
 
         if (message.type === 'REMOVE_TOOLTIPS') {
           removeMarks();
@@ -398,7 +469,7 @@ export default defineContentScript({
           return;
         }
 
-        // ===== ELEMENT TRACKER DEBUG =====
+        // ===== DEBUG MODE =====
 
         if (message.type === 'SET_DEBUG_MODE' && tracker) {
           tracker.setDebugMode(message.enabled ?? false);
@@ -406,7 +477,7 @@ export default defineContentScript({
           return;
         }
 
-        // ===== GET TRACKER STATUS =====
+        // ===== TRACKER STATUS =====
 
         if (message.type === 'GET_TRACKER_STATUS') {
           if (tracker) {

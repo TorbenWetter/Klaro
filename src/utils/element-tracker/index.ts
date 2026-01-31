@@ -19,6 +19,8 @@ import {
   getInteractiveElements,
   isInteractiveElement,
   updateFingerprint,
+  getVisibleText,
+  normalizeText,
 } from './fingerprint';
 import { findBestMatch, matchAll, findUnmatched } from './matcher';
 import { TabStorage } from './storage';
@@ -94,27 +96,26 @@ export class ElementTracker extends EventTarget {
 
     // Set up mutation observer
     this.observer = new MutationObserver(this.handleMutations.bind(this));
-    this.observer.observe(
-      container instanceof Document ? container.body : container,
-      {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: [
-          'data-testid',
-          'aria-label',
-          'role',
-          'name',
-          'placeholder',
-          'value',
-          'disabled',
-          'id',
-          'href',
-        ],
-      }
-    );
+    this.observer.observe(container instanceof Document ? container.body : container, {
+      childList: true,
+      subtree: true,
+      characterData: true, // Detect text content changes (important for dynamic CTAs)
+      characterDataOldValue: true,
+      attributes: true,
+      attributeFilter: [
+        'data-testid',
+        'aria-label',
+        'role',
+        'name',
+        'placeholder',
+        'value',
+        'disabled',
+        'id',
+        'href',
+      ],
+    });
 
-    console.debug('[Klaro] ElementTracker started');
+    console.debug('[Klaro] ElementTracker started, tracking', this.tracked.size, 'elements');
   }
 
   /**
@@ -302,7 +303,7 @@ export class ElementTracker extends EventTarget {
         }
       }
 
-      // Check tracked elements against removed nodes
+      // Check tracked elements against removed nodes AND text changes
       for (const [id, tracked] of this.tracked) {
         const element = tracked.ref.deref();
 
@@ -319,25 +320,46 @@ export class ElementTracker extends EventTarget {
           // Element moved, update fingerprint
           const newFp = updateFingerprint(tracked.fingerprint, element, 1.0);
           tracked.fingerprint = newFp;
+          continue;
+        }
+
+        // Check if text content changed while element stayed in DOM
+        // This happens when React updates innerText without removing the element
+        if (tracked.status === 'active') {
+          const currentText = this.getElementText(element);
+          const storedText = tracked.fingerprint.textContent;
+
+          if (currentText !== storedText) {
+            const newFp = updateFingerprint(tracked.fingerprint, element, 1.0);
+            tracked.fingerprint = newFp;
+
+            // Emit element-matched so sidebar updates the UI
+            this.emitEvent({
+              type: 'element-matched',
+              fingerprint: newFp,
+              element,
+              confidence: 1.0,
+            });
+          }
         }
       }
 
-      // Find new interactive elements
+      // Find all interactive elements on page
       const allInteractive = getInteractiveElements(
-        this.container instanceof Document
-          ? this.container.body
-          : this.container
+        this.container instanceof Document ? this.container.body : this.container
       );
 
-      // Check for new elements
+      // FIRST: Try to match searching elements against candidates
+      // This must happen BEFORE tracking new elements to avoid duplicates
+      const matchedElements = await this.resolveSearchingElements(allInteractive);
+
+      // THEN: Track any remaining unmatched elements as new
       for (const element of allInteractive) {
-        if (!this.isTracked(element)) {
+        // Skip if already tracked OR was just matched to a searching element
+        if (!this.isTracked(element) && !matchedElements.has(element)) {
           this.trackElement(element);
         }
       }
-
-      // Try to match searching elements against new candidates
-      await this.resolveSearchingElements(allInteractive);
 
       // Save to storage
       await this.saveToStorage();
@@ -410,6 +432,14 @@ export class ElementTracker extends EventTarget {
     return false;
   }
 
+  /**
+   * Get normalized text from an element for comparison.
+   * Uses the same logic as fingerprint creation.
+   */
+  private getElementText(element: HTMLElement): string {
+    return normalizeText(getVisibleText(element), 100);
+  }
+
   // ===========================================================================
   // Grace Period & Re-identification
   // ===========================================================================
@@ -436,10 +466,10 @@ export class ElementTracker extends EventTarget {
 
   /**
    * Try to resolve searching elements against available candidates.
+   * Returns the set of elements that were matched (to avoid tracking them as new).
    */
-  private async resolveSearchingElements(
-    candidates: HTMLElement[]
-  ): Promise<void> {
+  private async resolveSearchingElements(candidates: HTMLElement[]): Promise<Set<HTMLElement>> {
+    const matchedElements = new Set<HTMLElement>();
     const searchingFingerprints: ElementFingerprint[] = [];
 
     for (const tracked of this.tracked.values()) {
@@ -448,7 +478,7 @@ export class ElementTracker extends EventTarget {
       }
     }
 
-    if (searchingFingerprints.length === 0) return;
+    if (searchingFingerprints.length === 0) return matchedElements;
 
     // Match searching fingerprints against candidates
     const matches = matchAll(
@@ -464,17 +494,18 @@ export class ElementTracker extends EventTarget {
         const tracked = this.tracked.get(id);
         if (tracked && tracked.status === 'searching') {
           this.handleElementMatched(tracked, match);
+          matchedElements.add(match.element);
         }
       }
     }
+
+    return matchedElements;
   }
 
   /**
    * Attempt to re-identify a single element.
    */
-  private attemptReidentification(
-    tracked: TrackedElement
-  ): MatchResult | null {
+  private attemptReidentification(tracked: TrackedElement): MatchResult | null {
     const candidates = getInteractiveElements(
       this.container instanceof Document ? this.container.body : this.container
     );
@@ -497,10 +528,7 @@ export class ElementTracker extends EventTarget {
   /**
    * Handle successful re-identification.
    */
-  private handleElementMatched(
-    tracked: TrackedElement,
-    match: MatchResult
-  ): void {
+  private handleElementMatched(tracked: TrackedElement, match: MatchResult): void {
     // Cancel grace period timeout
     const handle = this.searchingElements.get(tracked.fingerprint.id);
     if (handle) {
@@ -514,11 +542,7 @@ export class ElementTracker extends EventTarget {
     tracked.ref = new WeakRef(match.element);
     tracked.status = 'active';
     tracked.lostAt = null;
-    tracked.fingerprint = updateFingerprint(
-      tracked.fingerprint,
-      match.element,
-      match.confidence
-    );
+    tracked.fingerprint = updateFingerprint(tracked.fingerprint, match.element, match.confidence);
 
     this.emitEvent({
       type: 'element-matched',
@@ -622,9 +646,7 @@ export class ElementTracker extends EventTarget {
    * Emit a tracker event.
    */
   private emitEvent(event: TrackerEvent): void {
-    this.dispatchEvent(
-      new CustomEvent(event.type, { detail: event })
-    );
+    this.dispatchEvent(new CustomEvent(event.type, { detail: event }));
   }
 
   /**

@@ -8,7 +8,7 @@ export default defineConfig({
   modules: ['@wxt-dev/module-svelte'],
   manifest: {
     name: 'Klaro',
-    permissions: ['sidePanel', 'scripting', 'activeTab', 'storage'],
+    permissions: ['sidePanel', 'scripting', 'activeTab', 'storage', 'webNavigation'],
     host_permissions: ['https://generativelanguage.googleapis.com/*'],
     action: {
       default_title: 'Open Klaro',

@@ -309,39 +309,59 @@ export interface MatchWeights {
   className: number;
 }
 
-/** Default weights based on research consensus */
+/**
+ * Default weights for element matching.
+ *
+ * DESIGN RATIONALE:
+ * - DOM structure (tag, ancestors, position) is most reliable for re-identification
+ * - Text content is deprioritized because dynamic sites frequently change text
+ * - Identity attributes (testId, htmlId) are highest when present
+ * - Visual position is used as a strong signal when structure matches
+ *
+ * These weights were tuned for React/Vue/Angular SPAs where text
+ * changes frequently but DOM structure remains relatively stable.
+ */
 export const DEFAULT_WEIGHTS: MatchWeights = {
-  // Identity
-  testId: 1.0,
-  htmlId: 0.9,
+  // Identity (exact match when present)
+  testId: 1.0, // data-testid is explicitly stable
+  htmlId: 0.9, // IDs are usually stable (filtered for auto-generated)
 
-  // Semantic
-  role: 0.85,
-  ariaLabel: 0.85,
-  name: 0.8,
+  // Structural - HIGHEST PRIORITY
+  tagName: 0.95, // Must be same tag type
+  ancestorPath: 0.9, // DOM path is very stable across re-renders
+  siblingIndex: 0.85, // Position among siblings rarely changes
 
-  // Content
-  textContent: 0.75,
-  placeholder: 0.65,
-  alt: 0.6,
+  // Position - HIGH PRIORITY
+  boundingBox: 0.8, // Visual position is reliable for static layouts
 
-  // Structural
-  tagName: 0.5,
-  href: 0.45,
-  ancestorPath: 0.4,
-  siblingIndex: 0.3,
+  // Semantic (ARIA/accessibility attributes)
+  role: 0.7, // ARIA roles are usually stable
+  ariaLabel: 0.6, // May change for dynamic content
+  name: 0.7, // Form field names are stable
 
-  // Neighbor
-  neighborText: 0.3,
+  // Content - LOWER PRIORITY (changes frequently)
+  textContent: 0.3, // Button text, labels often change (CTAs, i18n)
+  placeholder: 0.5, // Usually stable
+  alt: 0.4, // May change for dynamic images
+  href: 0.6, // Links usually have stable hrefs
 
-  // Position
-  boundingBox: 0.2,
+  // Contextual
+  neighborText: 0.4, // Surrounding content may change
 
   // Deprioritized
-  className: 0.1,
+  className: 0.1, // CSS-in-JS generates random class names
 };
 
-/** Default tracker configuration */
+/**
+ * Default tracker configuration.
+ *
+ * TUNING NOTES:
+ * - confidenceThreshold: 0.6 (60%) balances precision vs recall. Lower values
+ *   may cause false matches, higher values may lose valid elements.
+ * - gracePeriodMs: 100ms accounts for React's batched updates and double-RAF
+ *   timing. Most framework re-renders complete within 2 animation frames (~33ms)
+ *   plus a safety margin.
+ */
 export const DEFAULT_CONFIG: TrackerConfig = {
   confidenceThreshold: 0.6,
   gracePeriodMs: 100,

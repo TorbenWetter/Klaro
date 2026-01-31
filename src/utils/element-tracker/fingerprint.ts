@@ -164,7 +164,10 @@ function getViewportPercent(rect: DOMRect): ViewportPercent {
 
 /**
  * Get visible text content of an element.
- * Excludes hidden elements and normalizes whitespace.
+ * Only collects DIRECT text nodes - not text from child elements.
+ * This prevents parent containers from having concatenated child text.
+ *
+ * Uses pure DOM API (childNodes, nodeType) - no selectors or attribute checks.
  */
 export function getVisibleText(element: HTMLElement): string {
   // For form elements, use value or placeholder
@@ -175,9 +178,28 @@ export function getVisibleText(element: HTMLElement): string {
     return element.placeholder || '';
   }
 
-  // Get text content, excluding script/style
-  const text = element.textContent || '';
-  return text;
+  // Collect only direct text nodes (nodeType 3 = TEXT_NODE)
+  const textParts: string[] = [];
+
+  for (const child of element.childNodes) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      const text = child.textContent?.trim();
+      if (text) {
+        textParts.push(text);
+      }
+    }
+  }
+
+  // If no direct text, try aria-label or title as fallback
+  if (textParts.length === 0) {
+    const ariaLabel = element.getAttribute('aria-label');
+    if (ariaLabel) return ariaLabel;
+
+    const title = element.getAttribute('title');
+    if (title) return title;
+  }
+
+  return textParts.join(' ');
 }
 
 /**
@@ -185,10 +207,7 @@ export function getVisibleText(element: HTMLElement): string {
  * Lowercases, trims, collapses whitespace, and truncates.
  */
 export function normalizeText(text: string, maxLength = 100): string {
-  const normalized = text
-    .trim()
-    .replace(/\s+/g, ' ')
-    .slice(0, maxLength);
+  const normalized = text.trim().replace(/\s+/g, ' ').slice(0, maxLength);
   return normalized;
 }
 
@@ -200,10 +219,7 @@ export function normalizeText(text: string, maxLength = 100): string {
  * Build ancestor path up to a landmark or max depth.
  * Stops at landmarks for stability (they're less likely to change).
  */
-export function buildAncestorPath(
-  element: HTMLElement,
-  maxDepth = 4
-): AncestorInfo[] {
+export function buildAncestorPath(element: HTMLElement, maxDepth = 4): AncestorInfo[] {
   const path: AncestorInfo[] = [];
   let current = element.parentElement;
   let depth = 0;
@@ -488,6 +504,7 @@ export function getStableClassString(element: HTMLElement): string {
 /**
  * Update a fingerprint with current element state.
  * Used after re-identification to refresh volatile attributes.
+ * IMPORTANT: Also updates textContent to capture label changes (e.g., CTA buttons).
  */
 export function updateFingerprint(
   fingerprint: ElementFingerprint,
@@ -499,6 +516,9 @@ export function updateFingerprint(
   return {
     ...fingerprint,
     // Update volatile attributes
+    textContent: normalizeText(getVisibleText(element), 100), // CRITICAL: Update text for dynamic content
+    ariaLabel: element.getAttribute('aria-label'),
+    placeholder: element.getAttribute('placeholder'),
     value: getElementValue(element),
     boundingBox: {
       x: rect.x,
@@ -518,17 +538,106 @@ export function updateFingerprint(
 // =============================================================================
 
 /**
+ * GENERIC ELEMENT DETECTION
+ *
+ * We detect interactive elements using ONLY these universal signals:
+ * 1. Semantic HTML (button, a[href], input, select, textarea)
+ * 2. ARIA roles (role="button", role="link", etc.)
+ * 3. Event listeners (detected by MAIN world script via data-klaro-has-click-listener)
+ * 4. cursor: pointer CSS (very reliable - devs set this to indicate clickability)
+ * 5. Inline event handlers (onclick, onmousedown, etc.)
+ * 6. Positive tabindex (indicates focusable/interactive)
+ *
+ * NO class name pattern matching - that's too site-specific.
+ */
+
+/**
+ * Check if an element has cursor: pointer style.
+ * This is a very reliable indicator of clickability.
+ */
+function hasCursorPointer(element: HTMLElement): boolean {
+  try {
+    const style = window.getComputedStyle(element);
+    return style.cursor === 'pointer';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check if an element is visible (not hidden by CSS).
+ */
+function isVisible(element: HTMLElement): boolean {
+  try {
+    const style = window.getComputedStyle(element);
+    if (style.display === 'none') return false;
+    if (style.visibility === 'hidden') return false;
+    if (style.opacity === '0') return false;
+
+    // Check if element has dimensions
+    const rect = element.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check if element has meaningful text content (not empty or just whitespace).
+ */
+function hasMeaningfulContent(element: HTMLElement): boolean {
+  // Check direct text content
+  const text = element.textContent?.trim();
+  if (text && text.length > 0 && text.length < 200) return true;
+
+  // Check for aria-label
+  if (element.getAttribute('aria-label')) return true;
+
+  // Check for title
+  if (element.getAttribute('title')) return true;
+
+  // Check for images with alt text
+  const img = element.querySelector('img[alt]');
+  if (img) return true;
+
+  // Check for SVG with aria-label
+  const svg = element.querySelector('svg[aria-label]');
+  if (svg) return true;
+
+  return false;
+}
+
+/**
  * Get all interactive elements from a container.
+ *
+ * DETECTION STRATEGIES (in order of reliability):
+ * 1. Semantic HTML elements (button, a[href], input, select, textarea)
+ * 2. ARIA roles (role="button", role="link", etc.)
+ * 3. Inline event handlers (onclick, onmousedown, etc.)
+ * 4. Framework event listeners (detected by MAIN world script)
+ * 5. cursor: pointer CSS (universal signal for clickability)
+ *
+ * NO class name pattern matching - we use only universal DOM/CSS signals.
  */
 export function getInteractiveElements(
   container: HTMLElement | Document = document
 ): HTMLElement[] {
-  const selector = [
+  const foundElements = new Set<HTMLElement>();
+
+  // ==========================================================================
+  // Strategy 1: Semantic HTML + ARIA + inline handlers
+  // These are the most reliable signals
+  // ==========================================================================
+  const semanticSelector = [
+    // Semantic HTML elements
     'button',
     'a[href]',
     'input:not([type="hidden"])',
     'select',
     'textarea',
+    // ARIA roles
     '[role="button"]',
     '[role="link"]',
     '[role="checkbox"]',
@@ -536,20 +645,105 @@ export function getInteractiveElements(
     '[role="switch"]',
     '[role="tab"]',
     '[role="menuitem"]',
+    '[role="option"]',
+    '[role="slider"]',
+    '[role="spinbutton"]',
+    '[role="textbox"]',
+    '[role="combobox"]',
+    '[role="searchbox"]',
+    '[role="listbox"]',
+    // Inline event handlers
     '[onclick]',
+    '[onmousedown]',
+    '[onmouseup]',
+    '[ontouchstart]',
+    '[onpointerdown]',
+    // Focusable elements (indicates interactivity)
     '[tabindex]:not([tabindex="-1"])',
   ].join(', ');
 
-  return Array.from(container.querySelectorAll(selector)) as HTMLElement[];
+  const semanticElements = container.querySelectorAll(semanticSelector);
+  for (const el of semanticElements) {
+    if (el instanceof HTMLElement && isVisible(el)) {
+      foundElements.add(el);
+    }
+  }
+
+  // ==========================================================================
+  // Strategy 2: Framework event listeners (React, Vue, etc.)
+  // Detected by MAIN world script which adds data-klaro-has-click-listener
+  // ==========================================================================
+  const listenerElements = container.querySelectorAll('[data-klaro-has-click-listener="true"]');
+  for (const el of listenerElements) {
+    if (el instanceof HTMLElement && isVisible(el)) {
+      foundElements.add(el);
+    }
+  }
+
+  // ==========================================================================
+  // Strategy 3: cursor: pointer detection
+  // This is a FALLBACK for pages without framework event detection.
+  // If MAIN world script found elements, cursor:pointer without a listener
+  // attribute is likely a FALSE POSITIVE (hover styling, not interactive).
+  // ==========================================================================
+  const hasFrameworkDetection = listenerElements.length > 0;
+
+  const cursorCandidates = container.querySelectorAll(
+    'div, span, li, td, th, label, img, svg, i, p, h1, h2, h3, h4, h5, h6'
+  );
+
+  // Viewport-relative size limits to filter out containers
+  const vw = window.innerWidth || 1024;
+  const vh = window.innerHeight || 768;
+  const minDimension = 10; // Minimum 10px to filter out tiny elements
+  const maxWidth = vw * 0.9; // 90% of viewport (filter out full-width containers)
+  const maxHeight = vh * 0.5; // 50% of viewport (filter out tall containers)
+
+  for (const el of cursorCandidates) {
+    if (!(el instanceof HTMLElement)) continue;
+    if (foundElements.has(el)) continue; // Already found
+
+    // Must have cursor: pointer
+    if (!hasCursorPointer(el)) continue;
+
+    // If framework detection is active, only include elements with listener attribute
+    // Otherwise, cursor:pointer without onClick is likely a false positive (hover styling)
+    if (hasFrameworkDetection && el.dataset.klaroHasClickListener !== 'true') {
+      continue;
+    }
+
+    // Must be visible
+    if (!isVisible(el)) continue;
+
+    // Must have meaningful content (text, aria-label, etc.)
+    if (!hasMeaningfulContent(el)) continue;
+
+    // Size check - filter out containers
+    const rect = el.getBoundingClientRect();
+    if (rect.width < minDimension || rect.height < minDimension) continue;
+    if (rect.width > maxWidth || rect.height > maxHeight) continue;
+
+    // Avoid elements with too many interactive children (likely containers)
+    const interactiveChildren = el.querySelectorAll('button, a, input, [role="button"]');
+    if (interactiveChildren.length > 2) continue;
+
+    foundElements.add(el);
+  }
+
+  return Array.from(foundElements);
 }
 
 /**
  * Check if an element is interactive (should be tracked).
+ *
+ * Uses only universal signals - NO class name pattern matching.
  */
 export function isInteractiveElement(element: HTMLElement): boolean {
   const tagName = element.tagName.toLowerCase();
 
-  // Common interactive tags
+  // ==========================================================================
+  // Semantic HTML elements
+  // ==========================================================================
   if (['button', 'select', 'textarea'].includes(tagName)) return true;
 
   // Links with href
@@ -560,7 +754,9 @@ export function isInteractiveElement(element: HTMLElement): boolean {
     return true;
   }
 
-  // Interactive ARIA roles
+  // ==========================================================================
+  // ARIA roles
+  // ==========================================================================
   const role = element.getAttribute('role');
   if (role) {
     const interactiveRoles = [
@@ -576,16 +772,44 @@ export function isInteractiveElement(element: HTMLElement): boolean {
       'spinbutton',
       'textbox',
       'combobox',
+      'searchbox',
+      'listbox',
     ];
     if (interactiveRoles.includes(role)) return true;
   }
 
-  // Has click handler
-  if (element.hasAttribute('onclick')) return true;
+  // ==========================================================================
+  // Inline event handlers
+  // ==========================================================================
+  if (
+    element.hasAttribute('onclick') ||
+    element.hasAttribute('onmousedown') ||
+    element.hasAttribute('onmouseup') ||
+    element.hasAttribute('ontouchstart') ||
+    element.hasAttribute('onpointerdown')
+  ) {
+    return true;
+  }
 
-  // Has positive tabindex
+  // ==========================================================================
+  // Focusable elements
+  // ==========================================================================
   const tabindex = element.getAttribute('tabindex');
   if (tabindex && tabindex !== '-1') return true;
+
+  // ==========================================================================
+  // Framework event listeners (React, Vue, etc.)
+  // Detected by MAIN world script
+  // ==========================================================================
+  if (element.dataset.klaroHasClickListener === 'true') return true;
+
+  // ==========================================================================
+  // cursor: pointer CSS (universal clickability signal)
+  // Only for elements with meaningful content
+  // ==========================================================================
+  if (hasCursorPointer(element) && isVisible(element) && hasMeaningfulContent(element)) {
+    return true;
+  }
 
   return false;
 }
