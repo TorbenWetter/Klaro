@@ -1,11 +1,95 @@
 @import "tailwindcss";
 
 body {
-  font-size: 16px;
-  margin: 0;
-  min-height: 100vh;
+    font-size: 16px;
+    margin: 0;
+    min-height: 100vh;
 }
 
 #app {
-  min-height: 100vh;
+    min-height: 100vh;
+}
+
+/* Markdown content in sidebar: headings, paragraphs, lists, emphasis */
+.sidebar-markdown {
+    --md-h1: 1.75rem;
+    --md-h2: 1.5rem;
+    --md-h3: 1.25rem;
+    --md-h4: 1.125rem;
+    --md-h5: 1rem;
+    --md-h6: 0.875rem;
+}
+
+.sidebar-markdown h1 {
+    font-size: var(--md-h1);
+    font-weight: 700;
+    margin: 0.75em 0 0.5em;
+    line-height: 1.25;
+}
+.sidebar-markdown h1:first-child {
+    margin-top: 0;
+}
+
+.sidebar-markdown h2 {
+    font-size: var(--md-h2);
+    font-weight: 700;
+    margin: 0.75em 0 0.5em;
+    line-height: 1.3;
+}
+
+.sidebar-markdown h3 {
+    font-size: var(--md-h3);
+    font-weight: 600;
+    margin: 0.6em 0 0.4em;
+    line-height: 1.35;
+}
+
+.sidebar-markdown h4,
+.sidebar-markdown h5,
+.sidebar-markdown h6 {
+    font-size: var(--md-h4);
+    font-weight: 600;
+    margin: 0.5em 0 0.35em;
+    line-height: 1.4;
+}
+
+.sidebar-markdown h5 {
+    font-size: var(--md-h5);
+}
+.sidebar-markdown h6 {
+    font-size: var(--md-h6);
+}
+
+.sidebar-markdown p {
+    margin: 0.5em 0;
+    line-height: 1.6;
+}
+
+.sidebar-markdown strong,
+.sidebar-markdown b {
+    font-weight: 700;
+}
+
+.sidebar-markdown em,
+.sidebar-markdown i {
+    font-style: italic;
+}
+
+.sidebar-markdown ul,
+.sidebar-markdown ol {
+    margin: 0.5em 0;
+    padding-left: 1.5em;
+}
+
+.sidebar-markdown ul {
+    list-style-type: disc;
+}
+
+.sidebar-markdown ol {
+    list-style-type: decimal;
+}
+
+.sidebar-markdown li {
+    margin: 0.25em 0;
+    line-height: 1.5;
 }
