@@ -13,7 +13,13 @@
     "zip": "wxt zip",
     "zip:firefox": "wxt zip -b firefox",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "postinstall": "wxt prepare"
+    "postinstall": "wxt prepare",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{js,ts,svelte,json,css,html,md}": "prettier --write"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
@@ -31,9 +37,13 @@
     "bits-ui": "^2.15.5",
     "embla-carousel-svelte": "^8.6.0",
     "formsnap": "^2.0.1",
+    "husky": "^9.1.7",
     "layerchart": "2.0.0-next.43",
+    "lint-staged": "^16.2.7",
     "mode-watcher": "^1.1.0",
     "paneforge": "^1.0.2",
+    "prettier": "^3.8.1",
+    "prettier-plugin-svelte": "^3.4.1",
     "svelte": "^5.46.0",
     "svelte-check": "^4.3.4",
     "svelte-sonner": "^1.0.7",

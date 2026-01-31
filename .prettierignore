@@ -1,0 +1,16 @@
+# Build outputs
+dist/
+.output/
+.wxt/
+
+# Dependencies
+node_modules/
+pnpm-lock.yaml
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+*.min.js
+*.min.css
