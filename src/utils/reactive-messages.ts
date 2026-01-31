@@ -91,12 +91,25 @@ export interface GetSubtreeDescriptionMessage {
   changeId: string;
 }
 
+/** Add tooltips to difficult words */
+export interface AddTooltipsMessage {
+  type: 'ADD_TOOLTIPS';
+  words: Array<{ word: string; explanation: string }>;
+}
+
+/** Remove all tooltips */
+export interface RemoveTooltipsMessage {
+  type: 'REMOVE_TOOLTIPS';
+}
+
 export type SidepanelToContentMessage =
   | StartTrackingMessage
   | StopTrackingMessage
   | ProcessChangeMessage
   | DismissChangeMessage
-  | GetSubtreeDescriptionMessage;
+  | GetSubtreeDescriptionMessage
+  | AddTooltipsMessage
+  | RemoveTooltipsMessage;
 
 // ============================================================================
 // PENDING CHANGE QUEUE ITEM (for UI)

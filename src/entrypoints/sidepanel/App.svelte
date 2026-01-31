@@ -25,6 +25,7 @@
     import { Separator } from "$lib/components/ui/separator";
     import { Skeleton } from "$lib/components/ui/skeleton";
     import * as Tabs from "$lib/components/ui/tabs";
+    import { BookOpen, Accessibility } from "@lucide/svelte";
 
     // Constants
     const COOLDOWN_MS = 10_000;
@@ -610,6 +611,7 @@
     <!-- HEADER -->
     <header class="p-4 bg-card border-b flex justify-between items-center sticky top-0 z-10">
         <div class="flex items-center gap-2">
+            <img src="/Klaro_Logo_Yellow.svg" alt="Klaro" class="h-9 w-9 shrink-0 rounded" width="36" height="36" />
             <h1 class="font-bold text-xl">Klaro</h1>
             {#if isTracking}
                 <Badge variant="secondary" class="text-xs">Live</Badge>
@@ -636,11 +638,13 @@
     <!-- TABS -->
     <Tabs.Root bind:value={activeTab} class="flex-1 flex flex-col">
         <Tabs.List class="grid w-full grid-cols-2 rounded-none border-b">
-            <Tabs.Trigger value="read" class="rounded-none data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
-                📖 Read
+            <Tabs.Trigger value="read" class="rounded-none data-[state=active]:bg-primary data-[state=active]:text-primary-foreground flex items-center justify-center gap-2">
+                <BookOpen size={16} aria-hidden="true" />
+                Read
             </Tabs.Trigger>
-            <Tabs.Trigger value="accessible" class="rounded-none data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
-                ♿ Accessible
+            <Tabs.Trigger value="accessible" class="rounded-none data-[state=active]:bg-primary data-[state=active]:text-primary-foreground flex items-center justify-center gap-2">
+                <Accessibility size={16} aria-hidden="true" />
+                Accessible
                 {#if pendingCount > 0}
                     <Badge variant="destructive" class="ml-1 text-xs h-5 px-1.5">
                         {pendingCount}
@@ -743,6 +747,7 @@
                             {/if}
                         </article>
                     </Tabs.Content>
+
                 {/if}
             </div>
         </ScrollArea>
