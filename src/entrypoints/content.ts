@@ -1,4 +1,4 @@
-import { scanPage, clickElementById } from '../utils/dom-scanner';
+import { scanPage, clickElementById, setInputValue, checkboxToggle } from '../utils/dom-scanner';
 
 const PAGE_UPDATED_DEBOUNCE_MS = 600;
 
@@ -45,7 +45,7 @@ export default defineContentScript({
 
     browser.runtime.onMessage.addListener(
       (
-        message: { type: string; id?: string },
+        message: { type: string; id?: string; value?: string; checked?: boolean },
         _sender: unknown,
         sendResponse: (r: unknown) => void,
       ) => {
@@ -66,6 +66,16 @@ export default defineContentScript({
         }
         if (message.type === 'CLICK_ELEMENT' && message.id) {
           const ok = clickElementById(message.id);
+          sendResponse({ ok });
+          return;
+        }
+        if (message.type === 'SET_INPUT_VALUE' && message.id && message.value !== undefined) {
+          const ok = setInputValue(message.id, message.value);
+          sendResponse({ ok });
+          return;
+        }
+        if (message.type === 'TOGGLE_CHECKBOX' && message.id) {
+          const ok = checkboxToggle(message.id, message.checked);
           sendResponse({ ok });
           return;
         }

@@ -57,17 +57,65 @@ function getElementLabel(el: HTMLElement): string {
   const tag = el.tagName.toLowerCase();
   if (tag === 'input' || tag === 'select' || tag === 'textarea') {
     const input = el as HTMLInputElement;
-    return (
+    
+    // Try various label sources
+    const label = 
       input.placeholder ||
-      input.value ||
       el.getAttribute('aria-label') ||
-      el.innerText ||
-      ''
-    ).trim();
+      // Check for associated label element
+      getLabelForInput(input) ||
+      // Check parent cell text (for table layouts)
+      getParentCellLabel(el) ||
+      // Fall back to name attribute
+      input.name ||
+      input.id ||
+      '';
+    
+    return label.trim();
   }
   return (
     (el.getAttribute('aria-label') || el.innerText || '').trim()
   );
+}
+
+/**
+ * Find a label element associated with an input via 'for' attribute or wrapping
+ */
+function getLabelForInput(input: HTMLInputElement): string {
+  // Check for label with matching 'for' attribute
+  if (input.id) {
+    const label = document.querySelector(`label[for="${input.id}"]`);
+    if (label) return label.textContent?.trim() || '';
+  }
+  
+  // Check if input is wrapped in a label
+  const parentLabel = input.closest('label');
+  if (parentLabel) {
+    // Get text content excluding the input itself
+    const clone = parentLabel.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll('input, select, textarea').forEach(el => el.remove());
+    return clone.textContent?.trim() || '';
+  }
+  
+  return '';
+}
+
+/**
+ * For table-based layouts, get label from adjacent cells
+ */
+function getParentCellLabel(el: HTMLElement): string {
+  const cell = el.closest('td, th');
+  if (!cell) return '';
+  
+  // Check previous sibling cell (common pattern: label in first column)
+  const prevCell = cell.previousElementSibling;
+  if (prevCell && (prevCell.tagName === 'TD' || prevCell.tagName === 'TH')) {
+    const text = prevCell.textContent?.trim() || '';
+    // Remove trailing colon if present
+    return text.replace(/:$/, '');
+  }
+  
+  return '';
 }
 
 function isInteractiveAndVisible(node: Node): boolean {
@@ -77,6 +125,15 @@ function isInteractiveAndVisible(node: Node): boolean {
     if (el.getAttribute?.('role') !== 'button') return false;
   }
   if (el.offsetParent === null) return false;
+  
+  // For inputs, always include them even without a label
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+    const input = el as HTMLInputElement;
+    // Skip hidden inputs
+    if (input.type === 'hidden') return false;
+    return true;
+  }
+  
   const label = getElementLabel(el);
   return label.length > 0;
 }
@@ -166,6 +223,12 @@ export function scanPage(): ScanResult {
           const t = (el.textContent ?? '').trim();
           return t.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
         }
+        // Always include visible inputs, textareas, selects
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+          const input = el as HTMLInputElement;
+          if (input.type === 'hidden') return NodeFilter.FILTER_SKIP;
+          return NodeFilter.FILTER_ACCEPT;
+        }
         if (INTERACTIVE_TAGS.has(tag) || el.getAttribute?.('role') === 'button') {
           return getElementLabel(el).length > 0
             ? NodeFilter.FILTER_ACCEPT
@@ -227,10 +290,64 @@ export function clickElementById(id: string): boolean {
   if (!el) return false;
   el.click();
   if (typeof el.focus === 'function') el.focus();
+  highlightElement(el);
+  return true;
+}
+
+/**
+ * Sets the value of an input/textarea element and dispatches appropriate events.
+ */
+export function setInputValue(id: string, value: string): boolean {
+  const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(
+    `[${ACTION_DATA_ATTR}="${id}"]`,
+  );
+  if (!el) return false;
+  
+  // Focus the element first
+  el.focus();
+  
+  // Set the value
+  el.value = value;
+  
+  // Dispatch input and change events to trigger any listeners
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  
+  highlightElement(el);
+  return true;
+}
+
+/**
+ * Toggles a checkbox or switch element.
+ */
+export function checkboxToggle(id: string, checked?: boolean): boolean {
+  const el = document.querySelector<HTMLInputElement>(
+    `[${ACTION_DATA_ATTR}="${id}"]`,
+  );
+  if (!el) return false;
+  
+  // If checked is provided, set to that value; otherwise toggle
+  if (checked !== undefined) {
+    el.checked = checked;
+  } else {
+    el.checked = !el.checked;
+  }
+  
+  // Dispatch change event
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  
+  highlightElement(el);
+  return true;
+}
+
+/**
+ * Briefly highlights an element to show it was interacted with.
+ */
+function highlightElement(el: HTMLElement): void {
   const originalBorder = el.style.border;
   el.style.border = '4px solid #FFEB3B';
   setTimeout(() => {
     el.style.border = originalBorder;
   }, 1000);
-  return true;
 }

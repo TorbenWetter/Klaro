@@ -1,33 +1,65 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { convertPageToUIWithCache, type AccessibleUI } from '../../utils/page-to-ui';
+  import type { ScanResult, ArticleResult } from '../../utils/dom-scanner';
   import { getLLMSimplification } from '../../utils/llm-service';
-  import type {
-    ArticleResult,
-    ScannedAction,
-    ScannedHeading,
-    PageBlock,
-  } from '../../utils/dom-scanner';
+  import { UIRenderer } from '$lib/components/ui-renderer';
+  import type { ActionBinding } from '$lib/schemas/accessible-ui';
+  
+  // shadcn components
+  import { Button } from '$lib/components/ui/button';
+  import { Skeleton } from '$lib/components/ui/skeleton';
+  import * as Tabs from '$lib/components/ui/tabs';
+  import * as Alert from '$lib/components/ui/alert';
+  import * as Card from '$lib/components/ui/card';
+  import { Separator } from '$lib/components/ui/separator';
+  import { ScrollArea } from '$lib/components/ui/scroll-area';
 
-  type Mode = 'READ' | 'ACCESSIBLE';
+  const COOLDOWN_MS = 10_000; // 10 second cooldown between scans
 
-  const AUTO_REFRESH_INTERVAL_MS = 45_000;
-
-  let mode = $state<Mode>('ACCESSIBLE');
+  let activeTab = $state('accessible');
   let loading = $state(false);
-  let article = $state<ArticleResult | null>(null);
-  let headings = $state<ScannedHeading[]>([]);
-  let actions = $state<ScannedAction[]>([]);
-  let pageCopy = $state<PageBlock[]>([]);
-  let simplifiedSummary = $state('');
   let scanError = $state<string | null>(null);
+  let accessibleUI = $state<AccessibleUI | null>(null);
+  let currentUrl = $state('');
+  
+  // For READ mode
+  let article = $state<ArticleResult | null>(null);
+  let simplifiedSummary = $state('');
 
-  let refreshIntervalId: ReturnType<typeof setInterval> | null = null;
-  let pageUpdatedListener: ((msg: { type?: string }) => void) | null = null;
-  let visibilityOff: (() => void) | null = null;
+  // Cooldown state
+  let lastScanTime = $state(0);
+  let cooldownRemaining = $state(0);
+  let cooldownIntervalId: ReturnType<typeof setInterval> | null = null;
+
+  // Check if we're in cooldown
+  const isOnCooldown = $derived(cooldownRemaining > 0);
+
+  function startCooldown() {
+    lastScanTime = Date.now();
+    cooldownRemaining = COOLDOWN_MS;
+    
+    if (cooldownIntervalId) clearInterval(cooldownIntervalId);
+    cooldownIntervalId = setInterval(() => {
+      const elapsed = Date.now() - lastScanTime;
+      cooldownRemaining = Math.max(0, COOLDOWN_MS - elapsed);
+      if (cooldownRemaining <= 0 && cooldownIntervalId) {
+        clearInterval(cooldownIntervalId);
+        cooldownIntervalId = null;
+      }
+    }, 100);
+  }
 
   async function scanCurrentTab() {
+    // Check cooldown
+    if (isOnCooldown) {
+      return;
+    }
+
     loading = true;
     scanError = null;
+    startCooldown();
+    
     try {
       const [tab] = await browser.tabs.query({
         active: true,
@@ -35,19 +67,15 @@
       });
 
       if (!tab?.id) {
-        scanError = 'No active tab.';
+        scanError = 'No active tab found.';
         return;
       }
 
+      currentUrl = tab.url ?? '';
+
       const response = await browser.tabs.sendMessage(tab.id, {
         type: 'SCAN_PAGE',
-      }) as {
-        article: ArticleResult | null;
-        headings: ScannedHeading[];
-        actions: ScannedAction[];
-        pageCopy: PageBlock[];
-        error?: string;
-      };
+      }) as ScanResult & { error?: string };
 
       if (response.error) {
         scanError = response.error;
@@ -55,18 +83,19 @@
       }
 
       article = response.article ?? null;
-      headings = response.headings ?? [];
-      actions = response.actions ?? [];
-      pageCopy = response.pageCopy ?? [];
 
-      const { summary } = await getLLMSimplification(article, actions);
-      simplifiedSummary = summary;
+      // Generate accessible UI and summary in parallel
+      const [ui, llmResult] = await Promise.all([
+        convertPageToUIWithCache(response, currentUrl),
+        getLLMSimplification(response.article, response.actions),
+      ]);
+
+      accessibleUI = ui;
+      simplifiedSummary = llmResult.summary;
     } catch (e) {
       scanError = e instanceof Error ? e.message : 'Could not scan this page.';
+      accessibleUI = null;
       article = null;
-      headings = [];
-      actions = [];
-      pageCopy = [];
       simplifiedSummary = '';
     } finally {
       loading = false;
@@ -81,174 +110,230 @@
     });
   }
 
+  function handleUIAction(binding: ActionBinding) {
+    handleActionClick(binding.elementId);
+  }
+
+  // Debounce input changes to avoid too many messages
+  let inputDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  
+  function handleInputChange(elementId: string, value: string) {
+    console.log('[App] handleInputChange:', { elementId, value });
+    
+    // Clear existing timer for this element
+    const existingTimer = inputDebounceTimers.get(elementId);
+    if (existingTimer) clearTimeout(existingTimer);
+    
+    // Set new debounced timer (300ms delay)
+    const timer = setTimeout(() => {
+      console.log('[App] Sending SET_INPUT_VALUE:', { elementId, value });
+      browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
+        if (tabs[0]?.id) {
+          browser.tabs.sendMessage(tabs[0].id, { 
+            type: 'SET_INPUT_VALUE', 
+            id: elementId, 
+            value 
+          });
+        }
+      });
+      inputDebounceTimers.delete(elementId);
+    }, 300);
+    
+    inputDebounceTimers.set(elementId, timer);
+  }
+
+  function handleToggle(elementId: string, checked: boolean) {
+    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
+      if (tabs[0]?.id) {
+        browser.tabs.sendMessage(tabs[0].id, { 
+          type: 'TOGGLE_CHECKBOX', 
+          id: elementId, 
+          checked 
+        });
+      }
+    });
+  }
+
   onMount(() => {
-    scanCurrentTab();
+    // Initial scan on load (no cooldown for first scan)
+    loading = true;
+    scanError = null;
+    
+    browser.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
+      if (!tab?.id) {
+        scanError = 'No active tab found.';
+        loading = false;
+        return;
+      }
 
-    // React to page DOM changes (SPA nav, dynamic content)
-    pageUpdatedListener = (msg: { type?: string }) => {
-      if (msg?.type === 'PAGE_UPDATED') scanCurrentTab();
-    };
-    browser.runtime.onMessage.addListener(pageUpdatedListener);
+      currentUrl = tab.url ?? '';
 
-    // Auto-refresh when panel becomes visible again
-    const onVisibility = () => {
-      if (document.visibilityState === 'visible') scanCurrentTab();
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-    visibilityOff = () =>
-      document.removeEventListener('visibilitychange', onVisibility);
+      try {
+        const response = await browser.tabs.sendMessage(tab.id, {
+          type: 'SCAN_PAGE',
+        }) as ScanResult & { error?: string };
 
-    // Periodic auto-refresh while panel is open
-    refreshIntervalId = setInterval(() => {
-      if (document.visibilityState === 'visible') scanCurrentTab();
-    }, AUTO_REFRESH_INTERVAL_MS);
+        if (response.error) {
+          scanError = response.error;
+          return;
+        }
+
+        article = response.article ?? null;
+
+        const [ui, llmResult] = await Promise.all([
+          convertPageToUIWithCache(response, currentUrl),
+          getLLMSimplification(response.article, response.actions),
+        ]);
+
+        accessibleUI = ui;
+        simplifiedSummary = llmResult.summary;
+      } catch (e) {
+        scanError = e instanceof Error ? e.message : 'Could not scan this page.';
+        accessibleUI = null;
+        article = null;
+        simplifiedSummary = '';
+      } finally {
+        loading = false;
+      }
+    });
   });
 
   onDestroy(() => {
-    if (refreshIntervalId !== null) clearInterval(refreshIntervalId);
-    if (pageUpdatedListener !== null)
-      browser.runtime.onMessage.removeListener(pageUpdatedListener);
-    if (visibilityOff !== null) visibilityOff();
+    if (cooldownIntervalId !== null) clearInterval(cooldownIntervalId);
   });
 </script>
 
-<main class="h-screen flex flex-col bg-[#FDFBF7] text-black font-sans">
+<main class="h-screen flex flex-col bg-background text-foreground">
   <!-- HEADER -->
-  <header
-    class="p-4 bg-white border-b-2 border-black flex justify-between items-center sticky top-0 z-10"
-  >
+  <header class="p-4 bg-card border-b flex justify-between items-center sticky top-0 z-10">
     <h1 class="font-bold text-xl">Klaro</h1>
-    <button
-      onclick={scanCurrentTab}
-      class="text-sm bg-gray-200 px-3 py-1 rounded hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+    <Button 
+      variant="outline" 
+      size="sm" 
+      onclick={() => scanCurrentTab()} 
+      disabled={isOnCooldown || loading}
     >
-      ↻ Refresh
-    </button>
+      {#if isOnCooldown}
+        {Math.ceil(cooldownRemaining / 1000)}s
+      {:else}
+        ↻ Refresh
+      {/if}
+    </Button>
   </header>
 
   <!-- TABS -->
-  <div class="flex border-b-2 border-black">
-    <button
-      type="button"
-      onclick={() => (mode = 'READ')}
-      class="flex-1 py-4 font-bold text-lg border-r-2 border-black transition-colors {mode ===
-      'READ'
-      ? 'bg-[#FFEB3B]'
-      : 'bg-white'} focus:outline-none focus:ring-2 focus:ring-inset focus:ring-black"
-    >
-      📖 Read
-    </button>
-    <button
-      type="button"
-      onclick={() => (mode = 'ACCESSIBLE')}
-      class="flex-1 py-4 font-bold text-lg transition-colors {mode ===
-      'ACCESSIBLE'
-      ? 'bg-[#FFEB3B]'
-      : 'bg-white'} focus:outline-none focus:ring-2 focus:ring-inset focus:ring-black"
-    >
-      ♿ Accessible
-    </button>
-  </div>
+  <Tabs.Root bind:value={activeTab} class="flex-1 flex flex-col">
+    <Tabs.List class="grid w-full grid-cols-2 rounded-none border-b">
+      <Tabs.Trigger value="read" class="rounded-none data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
+        📖 Read
+      </Tabs.Trigger>
+      <Tabs.Trigger value="accessible" class="rounded-none data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
+        ♿ Accessible
+      </Tabs.Trigger>
+    </Tabs.List>
 
-  <!-- CONTENT -->
-  <div class="flex-1 overflow-y-auto p-4 space-y-6">
-    {#if loading}
-      <div class="flex justify-center items-center h-40">
-        <p class="text-xl font-medium animate-pulse">Thinking...</p>
-      </div>
-    {:else if scanError}
-      <div class="p-4 bg-red-50 border-2 border-red-600 rounded-xl">
-        <p class="text-lg font-medium text-red-900">{scanError}</p>
-        <p class="mt-2 text-sm text-red-700">
-          Try refreshing the page or open a normal webpage (not chrome:// or
-          extension pages).
-        </p>
-        <button
-          type="button"
-          onclick={scanCurrentTab}
-          class="mt-4 text-sm bg-red-200 px-3 py-1 rounded hover:bg-red-300"
-        >
-          Try again
-        </button>
-      </div>
-    {:else}
-      <!-- READ MODE -->
-      {#if mode === 'READ'}
-        {#if article}
+    <ScrollArea class="flex-1">
+      <div class="p-4">
+        {#if loading}
+          <!-- Loading State -->
           <div class="space-y-4">
-            <h2 class="text-3xl font-bold leading-tight">{article.title}</h2>
-
-            <div
-              class="bg-blue-50 border-2 border-blue-800 p-4 rounded-xl"
-            >
-              <p class="text-lg leading-relaxed font-medium">
-                {simplifiedSummary}
-              </p>
+            <Skeleton class="h-8 w-3/4" />
+            <Skeleton class="h-4 w-full" />
+            <Skeleton class="h-4 w-full" />
+            <Skeleton class="h-4 w-2/3" />
+            <Separator class="my-4" />
+            <Skeleton class="h-32 w-full rounded-lg" />
+            <div class="flex gap-2 pt-4">
+              <Skeleton class="h-10 w-28 rounded-md" />
+              <Skeleton class="h-10 w-28 rounded-md" />
             </div>
-
-            <hr class="border-gray-300" />
-
-            <p
-              class="text-lg text-gray-700 leading-relaxed whitespace-pre-wrap"
-            >
-              {article.textContent}
-            </p>
           </div>
-        {:else}
-          <div class="p-4 bg-gray-100 rounded-lg text-center">
-            <p class="text-lg">No article text found on this page.</p>
-            <button
-              type="button"
-              onclick={() => (mode = 'ACCESSIBLE')}
-              class="mt-4 text-blue-700 underline hover:no-underline"
-            >
-              Open accessible version
-            </button>
-          </div>
-        {/if}
-      {/if}
-
-      <!-- ACCESSIBLE: real copy of the page in reading order -->
-      {#if mode === 'ACCESSIBLE'}
-        <article
-          class="space-y-4"
-          aria-label="Accessible copy of this page"
-        >
-          {#each pageCopy as block, i (i)}
-            {#if block.type === 'heading'}
-              <h
-                class="block font-bold text-black"
-                style="font-size: {block.level === 1
-                  ? '1.75rem'
-                  : block.level === 2
-                    ? '1.5rem'
-                    : block.level === 3
-                      ? '1.25rem'
-                      : '1.125rem'}; padding-left: {(block.level - 1) * 0.5}rem"
-              >
-                {block.text}
-              </h>
-            {:else if block.type === 'text'}
-              <p class="text-lg text-gray-900 leading-relaxed whitespace-pre-wrap">
-                {block.content}
-              </p>
-            {:else if block.type === 'action'}
-              <button
-                type="button"
-                onclick={() => handleActionClick(block.id)}
-                class="w-full text-left p-3 bg-white border-2 border-black rounded-lg shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] hover:translate-y-[1px] hover:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] active:translate-y-[3px] active:shadow-none transition-all focus:outline-none focus:ring-4 focus:ring-offset-1 focus:ring-black text-base font-medium"
-              >
-                {block.text}
-              </button>
+        {:else if scanError}
+          <!-- Error State -->
+          <Alert.Root variant="destructive">
+            <Alert.Title>Unable to scan page</Alert.Title>
+            <Alert.Description>
+              {scanError}
+              <br /><br />
+              Try refreshing the page or open a normal webpage (not chrome:// or extension pages).
+            </Alert.Description>
+          </Alert.Root>
+          <Button 
+            variant="outline" 
+            class="mt-4" 
+            onclick={() => scanCurrentTab()}
+            disabled={isOnCooldown}
+          >
+            {#if isOnCooldown}
+              Wait {Math.ceil(cooldownRemaining / 1000)}s
+            {:else}
+              Try again
             {/if}
-          {/each}
-          {#if pageCopy.length === 0}
-            <p class="text-lg text-gray-700">
-              No content could be extracted. Try a different page or refresh.
-            </p>
-          {/if}
-        </article>
-      {/if}
-    {/if}
-  </div>
+          </Button>
+        {:else}
+          <!-- READ TAB -->
+          <Tabs.Content value="read" class="mt-0">
+            {#if article}
+              <div class="space-y-4">
+                <h2 class="text-2xl font-bold leading-tight">{article.title}</h2>
+                
+                <Card.Root>
+                  <Card.Header>
+                    <Card.Title class="text-base">Summary</Card.Title>
+                  </Card.Header>
+                  <Card.Content>
+                    <p class="text-base leading-relaxed">{simplifiedSummary}</p>
+                  </Card.Content>
+                </Card.Root>
+
+                <Separator />
+
+                <p class="text-base leading-relaxed whitespace-pre-wrap">
+                  {article.textContent}
+                </p>
+              </div>
+            {:else}
+              <Card.Root>
+                <Card.Content class="pt-6 text-center">
+                  <p class="text-muted-foreground">No article text found on this page.</p>
+                  <Button variant="link" class="mt-2" onclick={() => (activeTab = 'accessible')}>
+                    View accessible version instead
+                  </Button>
+                </Card.Content>
+              </Card.Root>
+            {/if}
+          </Tabs.Content>
+
+          <!-- ACCESSIBLE TAB -->
+          <Tabs.Content value="accessible" class="mt-0">
+            <article aria-label="Accessible version of this page">
+              {#if accessibleUI}
+                <div class="accessible-ui-container">
+                  {#if accessibleUI.title}
+                    <h1 class="text-2xl font-bold mb-2">{accessibleUI.title}</h1>
+                  {/if}
+                  {#if accessibleUI.description}
+                    <p class="text-muted-foreground mb-4">{accessibleUI.description}</p>
+                  {/if}
+                  <UIRenderer 
+                    nodes={accessibleUI.nodes} 
+                    onAction={handleUIAction}
+                    onInputChange={handleInputChange}
+                    onToggle={handleToggle}
+                  />
+                </div>
+              {:else}
+                <Alert.Root>
+                  <Alert.Title>Unable to generate view</Alert.Title>
+                  <Alert.Description>
+                    Could not create an accessible version of this page. Try refreshing.
+                  </Alert.Description>
+                </Alert.Root>
+              {/if}
+            </article>
+          </Tabs.Content>
+        {/if}
+      </div>
+    </ScrollArea>
+  </Tabs.Root>
 </main>
