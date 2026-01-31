@@ -32,44 +32,58 @@
     onInputChange?: (elementId: string, value: string) => void;
     /** Callback when a checkbox/switch is toggled */
     onToggle?: (elementId: string, checked: boolean) => void;
+    /** Callback when a select value changes */
+    onSelectChange?: (elementId: string, value: string) => void;
   }
 
-  let { nodes, onAction, onInputChange, onToggle }: Props = $props();
+  let { nodes, onAction, onInputChange, onToggle, onSelectChange }: Props = $props();
 
-  function handleAction(binding: ActionBinding | undefined) {
+  function handleAction(binding: ActionBinding | undefined): void {
     if (binding && onAction) {
       onAction(binding);
     }
   }
 
-  function handleInputChange(binding: ActionBinding | undefined, value: string) {
-    console.log('[UIRenderer] handleInputChange:', { binding, value, hasOnInputChange: !!onInputChange });
+  function handleInputChangeInternal(binding: ActionBinding | undefined, value: string): void {
     if (binding && onInputChange) {
       onInputChange(binding.elementId, value);
-    } else if (!binding) {
-      console.warn('[UIRenderer] No actionBinding for input!');
     }
   }
 
-  function handleToggle(binding: ActionBinding | undefined, checked: boolean) {
+  function handleToggleInternal(binding: ActionBinding | undefined, checked: boolean): void {
     if (binding && onToggle) {
       onToggle(binding.elementId, checked);
     }
   }
 
-  // Helper to get select value for single select
-  function getSelectValue(node: { defaultValue?: string; options: Array<{ value: string; label: string }> }) {
-    if (!node.defaultValue) return undefined;
-    return node.defaultValue;
+  function handleSelectChangeInternal(binding: ActionBinding | undefined, value: string): void {
+    if (binding && onSelectChange) {
+      onSelectChange(binding.elementId, value);
+    }
   }
 
-  // Debounce helper for input changes
-  function debounce<T extends (...args: unknown[]) => void>(fn: T, ms: number): T {
-    let timeoutId: ReturnType<typeof setTimeout>;
-    return ((...args: unknown[]) => {
-      clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => fn(...args), ms);
-    }) as T;
+  function getSelectValue(node: { defaultValue?: string; value?: string }): string | undefined {
+    return node.value ?? node.defaultValue;
+  }
+
+  /**
+   * Svelte action to set initial value without making input controlled.
+   * Only updates the value if the input is not focused (user not typing).
+   */
+  function setInitialValue(node: HTMLInputElement | HTMLTextAreaElement, value: string | undefined) {
+    // Set initial value on mount
+    if (value !== undefined && value !== '') {
+      node.value = value;
+    }
+    
+    return {
+      update(newValue: string | undefined) {
+        // Only update if input is not focused (user not actively typing)
+        if (document.activeElement !== node && newValue !== undefined) {
+          node.value = newValue;
+        }
+      }
+    };
   }
 </script>
 
@@ -131,35 +145,37 @@
   {:else if node.type === 'input'}
     <div class="mb-4">
       <Label class="mb-2">{node.label}</Label>
-      <Input
+      <input
+        class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-base shadow-sm transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium file:text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 md:text-sm"
         type={node.inputType ?? 'text'}
         placeholder={node.placeholder}
-        value={node.value}
         disabled={node.disabled}
         required={node.required}
         onfocus={() => handleAction(node.actionBinding)}
         oninput={(e: Event) => {
           const target = e.target as HTMLInputElement;
-          handleInputChange(node.actionBinding, target.value);
+          handleInputChangeInternal(node.actionBinding, target.value);
         }}
+        use:setInitialValue={node.value}
       />
     </div>
 
   {:else if node.type === 'textarea'}
     <div class="mb-4">
       <Label class="mb-2">{node.label}</Label>
-      <Textarea
+      <textarea
+        class="flex min-h-[60px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-base shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 md:text-sm"
         placeholder={node.placeholder}
-        value={node.value}
         rows={node.rows}
         disabled={node.disabled}
         required={node.required}
         onfocus={() => handleAction(node.actionBinding)}
         oninput={(e: Event) => {
           const target = e.target as HTMLTextAreaElement;
-          handleInputChange(node.actionBinding, target.value);
+          handleInputChangeInternal(node.actionBinding, target.value);
         }}
-      />
+        use:setInitialValue={node.value}
+      ></textarea>
     </div>
 
   {:else if node.type === 'checkbox'}
@@ -167,7 +183,7 @@
       <Checkbox
         checked={node.checked}
         disabled={node.disabled}
-        onCheckedChange={(checked: boolean) => handleToggle(node.actionBinding, checked)}
+        onCheckedChange={(checked: boolean) => handleToggleInternal(node.actionBinding, checked)}
       />
       <Label>{node.label}</Label>
     </div>
@@ -177,7 +193,7 @@
       <Switch
         checked={node.checked}
         disabled={node.disabled}
-        onCheckedChange={(checked: boolean) => handleToggle(node.actionBinding, checked)}
+        onCheckedChange={(checked: boolean) => handleToggleInternal(node.actionBinding, checked)}
       />
       <Label>{node.label}</Label>
     </div>
@@ -206,7 +222,7 @@
         type="single"
         value={getSelectValue(node)}
         disabled={node.disabled}
-        onValueChange={() => handleAction(node.actionBinding)}
+        onValueChange={(value) => handleSelectChangeInternal(node.actionBinding, value ?? '')}
       >
         <Select.Trigger class="w-full">
           {node.placeholder ?? 'Select an option'}
@@ -328,7 +344,7 @@
         </Card.Header>
       {/if}
       <Card.Content>
-        <Self nodes={node.children} {onAction} {onInputChange} {onToggle} />
+        <Self nodes={node.children} {onAction} {onInputChange} {onToggle} {onSelectChange} />
       </Card.Content>
     </Card.Root>
 
@@ -338,7 +354,7 @@
         <Accordion.Item value={`item-${i}`}>
           <Accordion.Trigger>{item.title}</Accordion.Trigger>
           <Accordion.Content>
-            <Self nodes={item.content} {onAction} {onInputChange} {onToggle} />
+            <Self nodes={item.content} {onAction} {onInputChange} {onToggle} {onSelectChange} />
           </Accordion.Content>
         </Accordion.Item>
       {/each}
@@ -353,14 +369,14 @@
       </Tabs.List>
       {#each node.items as item}
         <Tabs.Content value={item.id}>
-          <Self nodes={item.content} {onAction} {onInputChange} {onToggle} />
+          <Self nodes={item.content} {onAction} {onInputChange} {onToggle} {onSelectChange} />
         </Tabs.Content>
       {/each}
     </Tabs.Root>
 
   {:else if node.type === 'scrollArea'}
     <ScrollArea class="mb-4" style={node.maxHeight ? `max-height: ${node.maxHeight}` : undefined}>
-      <Self nodes={node.children} {onAction} {onInputChange} {onToggle} />
+      <Self nodes={node.children} {onAction} {onInputChange} {onToggle} {onSelectChange} />
     </ScrollArea>
   {/if}
 {/each}

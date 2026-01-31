@@ -160,6 +160,8 @@ export const SelectNode = z.object({
   placeholder: z.string().optional(),
   options: z.array(SelectOption).min(1),
   defaultValue: z.string().optional(),
+  /** Current value (for reactive updates) */
+  value: z.string().optional(),
   disabled: z.boolean().optional(),
   /** Binds this select to a real page element */
   actionBinding: ActionBinding.optional(),

@@ -35,23 +35,26 @@ export interface ScanResult {
   pageCopy: PageBlock[];
 }
 
-const INTERACTIVE_TAGS = new Set([
-  'button',
-  'a',
-  'input',
-  'select',
-  'textarea',
-]);
-/** Tags we treat as text blocks (one block per element, in document order). */
-const TEXT_BLOCK_TAGS = new Set([
-  'p',
-  'li',
-  'td',
-  'th',
-  'figcaption',
-  'blockquote',
-]);
+/** Tags that represent interactive elements */
+const INTERACTIVE_TAGS = new Set(['button', 'a', 'input', 'select', 'textarea']);
+
+/** Tags we treat as text blocks (one block per element, in document order) */
+const TEXT_BLOCK_TAGS = new Set(['p', 'li', 'td', 'th', 'figcaption', 'blockquote']);
+
+/** Data attribute used to store element IDs for interaction */
 const ACTION_DATA_ATTR = 'data-acc-id';
+
+/**
+ * Generates a unique ID for an element, or returns existing ID if already assigned.
+ */
+function getOrCreateElementId(el: HTMLElement): string {
+  let id = el.getAttribute(ACTION_DATA_ATTR);
+  if (!id) {
+    id = `cmd-${Math.random().toString(36).slice(2, 11)}`;
+    el.setAttribute(ACTION_DATA_ATTR, id);
+  }
+  return id;
+}
 
 function getElementLabel(el: HTMLElement): string {
   const tag = el.tagName.toLowerCase();
@@ -197,13 +200,8 @@ export function scanPage(): ScanResult {
 
   while (treeWalker.nextNode()) {
     const el = treeWalker.currentNode as HTMLElement;
-    let id = el.getAttribute(ACTION_DATA_ATTR);
-    if (!id) {
-      id = `cmd-${Math.random().toString(36).slice(2, 11)}`;
-      el.setAttribute(ACTION_DATA_ATTR, id);
-    }
     actions.push({
-      id,
+      id: getOrCreateElementId(el),
       tag: el.tagName.toLowerCase(),
       text: getElementLabel(el).slice(0, 50),
     });
@@ -255,14 +253,9 @@ export function scanPage(): ScanResult {
       continue;
     }
     if (INTERACTIVE_TAGS.has(tag) || el.getAttribute?.('role') === 'button') {
-      let id = el.getAttribute(ACTION_DATA_ATTR);
-      if (!id) {
-        id = `cmd-${Math.random().toString(36).slice(2, 11)}`;
-        el.setAttribute(ACTION_DATA_ATTR, id);
-      }
       pageCopy.push({
         type: 'action',
-        id,
+        id: getOrCreateElementId(el),
         tag,
         text: getElementLabel(el).slice(0, 80),
       });
@@ -332,6 +325,25 @@ export function checkboxToggle(id: string, checked?: boolean): boolean {
   } else {
     el.checked = !el.checked;
   }
+  
+  // Dispatch change event
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  
+  highlightElement(el);
+  return true;
+}
+
+/**
+ * Sets the value of a select element.
+ */
+export function setSelectValue(id: string, value: string): boolean {
+  const el = document.querySelector<HTMLSelectElement>(
+    `[${ACTION_DATA_ATTR}="${id}"]`,
+  );
+  if (!el) return false;
+  
+  el.value = value;
   
   // Dispatch change event
   el.dispatchEvent(new Event('change', { bubbles: true }));

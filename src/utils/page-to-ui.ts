@@ -1,11 +1,15 @@
 import type { ScanResult } from './dom-scanner';
 import { type AccessibleUI, parseAccessibleUI, getSchemaDescription } from '$lib/schemas/accessible-ui';
+import { type GeminiResponse, extractGeminiText, parseGeminiJson } from './gemini-types';
 
 /** Gemini API key from env (set in .env as VITE_GEMINI_API_KEY). */
 const GEMINI_API_KEY =
   (typeof import.meta !== 'undefined' && import.meta.env?.VITE_GEMINI_API_KEY) || '';
 
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+/** Cache TTL for UI conversions (5 minutes) */
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
 /**
  * Formats the scan result into a concise representation for the LLM
@@ -88,11 +92,7 @@ async function callGeminiForUI(scanText: string): Promise<AccessibleUI> {
   const body = {
     contents: [
       {
-        parts: [
-          {
-            text: `${systemPrompt}\n\n---\n\nPAGE DATA:\n${scanText}`,
-          },
-        ],
+        parts: [{ text: `${systemPrompt}\n\n---\n\nPAGE DATA:\n${scanText}` }],
       },
     ],
     generationConfig: {
@@ -112,27 +112,14 @@ async function callGeminiForUI(scanText: string): Promise<AccessibleUI> {
     throw new Error(`Gemini API error ${res.status}: ${errText.slice(0, 200)}`);
   }
 
-  interface CandidatePart {
-    text?: string;
-  }
-  interface CandidateContent {
-    parts?: CandidatePart[];
-  }
-  interface Candidate {
-    content?: CandidateContent;
-  }
-  const data = (await res.json()) as { candidates?: Candidate[] };
-
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  const data = (await res.json()) as GeminiResponse;
+  const text = extractGeminiText(data);
+  
   if (!text) {
     throw new Error('Gemini returned no text');
   }
 
-  // Extract JSON from the response (in case model wraps in markdown)
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  const jsonStr = jsonMatch ? jsonMatch[0] : text;
-
-  const parsed = JSON.parse(jsonStr);
+  const parsed = parseGeminiJson<unknown>(text);
   return parseAccessibleUI(parsed);
 }
 
@@ -223,8 +210,29 @@ export async function convertPageToUI(scan: ScanResult): Promise<AccessibleUI> {
 /**
  * Cache for storing converted UI by URL to avoid repeated LLM calls
  */
-const uiCache = new Map<string, { ui: AccessibleUI; timestamp: number }>();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+interface CacheEntry {
+  ui: AccessibleUI;
+  timestamp: number;
+}
+
+const uiCache = new Map<string, CacheEntry>();
+let lastCacheCleanup = 0;
+const CACHE_CLEANUP_INTERVAL_MS = 60_000; // Clean up at most once per minute
+
+/**
+ * Removes expired entries from the cache (runs periodically, not on every call)
+ */
+function cleanupCacheIfNeeded(): void {
+  const now = Date.now();
+  if (now - lastCacheCleanup < CACHE_CLEANUP_INTERVAL_MS) return;
+  
+  lastCacheCleanup = now;
+  for (const [key, value] of uiCache.entries()) {
+    if (now - value.timestamp > CACHE_TTL_MS) {
+      uiCache.delete(key);
+    }
+  }
+}
 
 /**
  * Converts page to UI with caching
@@ -234,21 +242,127 @@ export async function convertPageToUIWithCache(
   url: string,
 ): Promise<AccessibleUI> {
   const cached = uiCache.get(url);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
     return cached.ui;
   }
 
   const ui = await convertPageToUI(scan);
   uiCache.set(url, { ui, timestamp: Date.now() });
+  
+  // Periodically clean up expired entries
+  cleanupCacheIfNeeded();
 
-  // Clean up old cache entries
-  for (const [key, value] of uiCache.entries()) {
-    if (Date.now() - value.timestamp > CACHE_TTL) {
-      uiCache.delete(key);
+  return ui;
+}
+
+/**
+ * Converts a new subtree (like a modal or popup) into accessible UI structure
+ * This is used for incremental updates when new UI contexts appear
+ */
+export async function convertSubtreeToUI(
+  description: string,
+  elements: { id: string; tag: string; text: string }[],
+): Promise<AccessibleUI | null> {
+  if (!description && elements.length === 0) {
+    return null;
+  }
+
+  const prompt = `You are converting a new UI element that just appeared on the page into an accessible format.
+
+${getSchemaDescription()}
+
+NEW UI CONTENT:
+${description}
+
+INTERACTIVE ELEMENTS (use elementId for actionBinding):
+${elements.map(e => `- id="${e.id}" [${e.tag}] ${e.text}`).join('\n')}
+
+Create a concise accessible representation of this new UI. 
+If it's a dialog/modal, wrap it in a card with a clear title.
+Include all interactive elements with their actionBindings.
+
+Respond with ONLY valid JSON, no markdown formatting.`;
+
+  const body = {
+    contents: [
+      {
+        parts: [{ text: prompt }],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 2048,
+    },
+  };
+
+  try {
+    const res = await fetch(GEMINI_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      console.error('Gemini API error for subtree:', res.status);
+      return createFallbackSubtreeUI(elements);
+    }
+
+    const data = (await res.json()) as GeminiResponse;
+    const text = extractGeminiText(data);
+    
+    if (!text) {
+      return createFallbackSubtreeUI(elements);
+    }
+
+    const parsed = parseGeminiJson<unknown>(text);
+    return parseAccessibleUI(parsed);
+  } catch (e) {
+    console.error('Failed to convert subtree:', e);
+    return createFallbackSubtreeUI(elements);
+  }
+}
+
+/**
+ * Creates a simple fallback UI for a subtree when LLM fails
+ */
+function createFallbackSubtreeUI(
+  elements: { id: string; tag: string; text: string }[],
+): AccessibleUI {
+  const nodes: AccessibleUI['nodes'] = [];
+
+  for (const el of elements) {
+    if (el.tag === 'input' || el.tag === 'textarea') {
+      nodes.push({
+        type: 'input',
+        label: el.text || 'Input',
+        actionBinding: { elementId: el.id, action: 'click' },
+      });
+    } else if (el.tag === 'select') {
+      nodes.push({
+        type: 'select',
+        label: el.text || 'Select',
+        options: [{ value: '', label: '(options loading...)' }],
+        actionBinding: { elementId: el.id, action: 'click' },
+      });
+    } else {
+      nodes.push({
+        type: 'button',
+        label: el.text || el.tag,
+        variant: el.tag === 'a' ? 'link' : 'default',
+        actionBinding: { elementId: el.id, action: 'click' },
+      });
     }
   }
 
-  return ui;
+  return {
+    title: 'New Content',
+    description: 'New interactive elements appeared',
+    nodes: [{
+      type: 'card',
+      title: 'New Content',
+      children: nodes,
+    }],
+  };
 }
 
 export type { AccessibleUI };
