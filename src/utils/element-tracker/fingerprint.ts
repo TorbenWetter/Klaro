@@ -56,7 +56,7 @@ export function createFingerprint(element: HTMLElement): ElementFingerprint {
     ariaLabel: element.getAttribute('aria-label'),
     name: element.getAttribute('name'),
 
-    // Priority 3: Content
+    // Priority 3: Content (truncate for fingerprint matching only)
     textContent: normalizeText(getVisibleText(element), 100),
     placeholder: element.getAttribute('placeholder'),
     value: getElementValue(element),
@@ -204,11 +204,11 @@ export function getVisibleText(element: HTMLElement): string {
 
 /**
  * Normalize text for comparison.
- * Lowercases, trims, collapses whitespace, and truncates.
+ * Trims and collapses whitespace. Only truncates if maxLength is provided.
  */
-export function normalizeText(text: string, maxLength = 100): string {
-  const normalized = text.trim().replace(/\s+/g, ' ').slice(0, maxLength);
-  return normalized;
+export function normalizeText(text: string, maxLength?: number): string {
+  const normalized = text.trim().replace(/\s+/g, ' ');
+  return maxLength ? normalized.slice(0, maxLength) : normalized;
 }
 
 // =============================================================================

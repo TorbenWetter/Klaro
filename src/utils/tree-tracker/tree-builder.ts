@@ -349,7 +349,7 @@ export function extractLabel(element: HTMLElement): string {
   const labelledBy = element.getAttribute('aria-labelledby');
   if (labelledBy) {
     const labelText = resolveAriaLabelledBy(labelledBy);
-    if (labelText) return normalizeText(labelText, 100);
+    if (labelText) return normalizeText(labelText);
   }
 
   // Check aria-label
@@ -362,7 +362,7 @@ export function extractLabel(element: HTMLElement): string {
 
   // Get visible text - only direct text nodes (not nested)
   const directText = getVisibleText(element);
-  if (directText) return normalizeText(directText, 100);
+  if (directText) return normalizeText(directText);
 
   // For containers, try to infer from landmark role or tag
   // DO NOT use textContent fallback - that would duplicate child text
@@ -375,11 +375,12 @@ export function extractLabel(element: HTMLElement): string {
     if (landmark) return landmark;
   }
 
-  // For non-containers (text elements like span, p, etc.), use textContent
+  // For non-containers (text elements like span, p, etc.), use full textContent
+  // No length limit - show all text content for accessibility
   if (!CONTAINER_TAGS.has(tag)) {
     const fullText = element.textContent?.trim();
-    if (fullText && fullText.length > 0 && fullText.length < 200) {
-      return normalizeText(fullText, 100);
+    if (fullText && fullText.length > 0) {
+      return normalizeText(fullText);
     }
   }
 
@@ -521,7 +522,7 @@ function extractConsolidatedLabel(element: HTMLElement): string {
   const labelledBy = element.getAttribute('aria-labelledby');
   if (labelledBy) {
     const labelText = resolveAriaLabelledBy(labelledBy);
-    if (labelText) return normalizeText(labelText, 100);
+    if (labelText) return normalizeText(labelText);
   }
 
   // Then aria-label
@@ -560,7 +561,7 @@ function extractConsolidatedLabel(element: HTMLElement): string {
   collectText(element);
 
   const consolidated = textParts.join(' ').trim();
-  if (consolidated) return normalizeText(consolidated, 100);
+  if (consolidated) return normalizeText(consolidated);
 
   // Fallback to title or tag
   return element.getAttribute('title') || element.tagName.toLowerCase();
@@ -939,72 +940,8 @@ export function buildDOMTree(
     // Get label for non-interactive elements
     const label = extractLabel(element);
 
-    // Phase 1b: Additional check - skip elements with meaningless labels
-    // A label is meaningless if it's just the tag name or a generic container name
-    const meaninglessLabels = new Set([
-      'div',
-      'span',
-      'section',
-      'article',
-      'aside',
-      'figure',
-      'figcaption',
-      'container',
-      'wrapper',
-      'content',
-      'inner',
-      'outer',
-      'box',
-      'item',
-    ]);
-    const labelLower = label.toLowerCase();
-    const isMeaningless = meaninglessLabels.has(labelLower) || labelLower === tag;
-
-    if (isMeaningless) {
-      if (children.length > 0) {
-        // Update depths of promoted children
-        for (const child of children) {
-          child.depth = depth;
-        }
-        return children;
-      } else {
-        // Empty element with meaningless label - skip entirely
-        return null;
-      }
-    }
-
-    // FINAL SAFETY CHECK: Never create a node with label equal to tag name
-    // This catches ANY edge case where a meaningless element slipped through
-    const labelLowerFinal = label.toLowerCase();
-    const isTagLabel = labelLowerFinal === tag;
-    const isGenericLabel = [
-      'div',
-      'span',
-      'section',
-      'article',
-      'aside',
-      'header',
-      'footer',
-      'main',
-      'nav',
-    ].includes(labelLowerFinal);
-
-    if (isTagLabel || isGenericLabel) {
-      if (children.length > 0) {
-        for (const child of children) {
-          child.depth = depth;
-        }
-        return children;
-      }
-      return null;
-    }
-
-    // Also flatten single-child containers - just show the child directly
-    if (nodeType === 'container' && children.length === 1) {
-      const child = children[0];
-      child.depth = depth;
-      return child;
-    }
+    // NOTE: Meaningless label filtering has been removed to show ALL text content
+    // per spec: specs/show-all-text-content.md
 
     // Get aria-describedby for description
     const describedBy = element.getAttribute('aria-describedby');

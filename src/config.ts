@@ -96,12 +96,8 @@ export const CONFIG = {
     maxTokensLabel: 256,
     /** Max tokens for batch label enhancement */
     maxTokensBatch: 4096,
-    /** Max tokens for semantic grouping */
-    maxTokensGrouping: 8192,
     /** Temperature for deterministic responses */
     temperature: 0.2,
-    /** Slightly higher temperature for creative grouping */
-    groupingTemperature: 0.3,
   },
 
   /**

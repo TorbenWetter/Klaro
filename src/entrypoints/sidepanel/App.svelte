@@ -8,12 +8,9 @@
     DOMTree,
   } from '$lib/schemas/dom-tree';
   import { CONFIG } from '../../config';
-  import type { TrackedElementData, DisplayGroup } from '$lib/schemas/semantic-groups';
-  import { createFlatListFallback, generateGroupId } from '$lib/schemas/semantic-groups';
-  import type { ElementFingerprint, NodeType } from '../../utils/element-tracker/types';
-  import { semanticTreeStore } from './stores/semantic-tree.svelte';
-  import { generateSemanticGroups } from '../../utils/llm-service';
-  import GroupView from './components/GroupView.svelte';
+  import type { ElementFingerprint } from '../../utils/element-tracker/types';
+  import { domTreeStore } from './stores/dom-tree-store.svelte';
+  import TreeView from './components/TreeView.svelte';
 
   // shadcn components
   import * as Alert from '$lib/components/ui/alert';
@@ -50,10 +47,8 @@
 
   // Per-tab session cache for instant switching
   interface TabSession {
-    tree: import('$lib/schemas/semantic-groups').SemanticTree | null;
-    elements: Map<string, TrackedElementData>;
-    url: string;
-    title: string;
+    tree: DOMTree | null;
+    elementStates: Map<string, Record<string, unknown>>;
   }
   const tabSessionCache = new Map<number, TabSession>();
   let currentTabId: number | null = null;
@@ -199,16 +194,14 @@
    * Save current session to cache for the given tab.
    */
   function saveTabSession(tabId: number): void {
-    if (!semanticTreeStore.tree) return;
+    if (!domTreeStore.tree) return;
 
     // Convert Map to array of entries for JSON serialization
-    const elementsArray = Array.from(semanticTreeStore.elements.entries());
+    const statesArray = Array.from(domTreeStore.elementStates.entries());
 
     tabSessionCache.set(tabId, {
-      tree: deepClone(semanticTreeStore.tree),
-      elements: new Map(elementsArray.map(([k, v]) => [k, deepClone(v)])),
-      url: semanticTreeStore.url,
-      title: semanticTreeStore.title,
+      tree: deepClone(domTreeStore.tree),
+      elementStates: new Map(statesArray.map(([k, v]) => [k, deepClone(v)])),
     });
 
     // Limit cache size (keep last 10 tabs)
@@ -224,7 +217,7 @@
    * Restore session from cache for the given tab.
    * Returns true if session was restored, false if cache miss.
    */
-  async function restoreTabSession(tabId: number): Promise<boolean> {
+  function restoreTabSession(tabId: number): boolean {
     const cached = tabSessionCache.get(tabId);
 
     if (!cached || !cached.tree) {
@@ -232,7 +225,10 @@
     }
 
     // Restore cached session immediately
-    await semanticTreeStore.initializeTree(cached.tree, cached.elements);
+    domTreeStore.setTree(cached.tree);
+    for (const [id, state] of cached.elementStates) {
+      domTreeStore.updateElementState(id, state);
+    }
     return true;
   }
 
@@ -252,24 +248,24 @@
     currentTabId = tabId;
 
     // Try to restore from cache first (instant switch)
-    const restored = await restoreTabSession(tabId);
+    const restored = restoreTabSession(tabId);
     if (restored) {
-      semanticTreeStore.setLoading(false);
+      domTreeStore.setLoading(false);
       return;
     }
 
     // No cache - need to scan
-    semanticTreeStore.setLoading(true);
-    semanticTreeStore.setError(null);
-    semanticTreeStore.reset();
+    domTreeStore.setLoading(true);
+    domTreeStore.setError(null);
+    domTreeStore.reset();
 
     try {
       await performScan(tabId);
     } catch (e) {
-      semanticTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-      semanticTreeStore.reset();
+      domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+      domTreeStore.reset();
     } finally {
-      semanticTreeStore.setLoading(false);
+      domTreeStore.setLoading(false);
     }
   }
 
@@ -285,65 +281,8 @@
     return true;
   }
 
-  /**
-   * Convert DOMTreeNode to TrackedElementData
-   */
-  function nodeToElementData(
-    node: DOMTreeNode & {
-      value?: string;
-      checked?: boolean;
-      disabled?: boolean;
-      options?: Array<{ value: string; label: string; selected: boolean }>;
-    }
-  ): TrackedElementData {
-    return {
-      id: node.id,
-      fingerprint: node.fingerprint,
-      tagName: node.tagName,
-      nodeType: node.nodeType,
-      label: node.label,
-      originalLabel: node.originalLabel,
-      description: node.description,
-      interactiveType: node.interactiveType,
-      placeholder: node.placeholder,
-      headingLevel: node.headingLevel,
-      altText: node.altText,
-      // Extract form state from node (stored flat on TreeNode, nested in TrackedElementData)
-      formState: {
-        value: node.value,
-        checked: node.checked,
-        disabled: node.disabled,
-        options: node.options,
-      },
-    };
-  }
-
-  /**
-   * Flatten DOM tree to element map
-   */
-  function treeToElementMap(root: DOMTreeNode): Map<string, TrackedElementData> {
-    const elements = new Map<string, TrackedElementData>();
-
-    function traverse(node: DOMTreeNode): void {
-      // Only include meaningful elements (interactive, text, media)
-      if (
-        node.nodeType === 'interactive' ||
-        node.nodeType === 'text' ||
-        node.nodeType === 'media'
-      ) {
-        elements.set(node.id, nodeToElementData(node));
-      }
-      for (const child of node.children) {
-        traverse(child);
-      }
-    }
-
-    traverse(root);
-    return elements;
-  }
-
   // =============================================================================
-  // Scanning with Semantic Grouping
+  // Scanning (direct tree, no LLM grouping)
   // =============================================================================
 
   async function performScan(tabId: number): Promise<void> {
@@ -353,46 +292,12 @@
     })) as ScanTreeResponse;
 
     if (response.error || !response.tree) {
-      semanticTreeStore.setError(response.error || 'Scan failed');
+      domTreeStore.setError(response.error || 'Scan failed');
       return;
     }
 
-    const { tree } = response;
-
-    // Convert DOM tree nodes to element map
-    const elements = treeToElementMap(tree.root);
-
-    // Try to generate semantic groups via LLM
-    let groups: DisplayGroup[] | null = null;
-
-    try {
-      groups = await generateSemanticGroups(elements, tree.title, tree.url);
-    } catch (error) {
-      console.warn('[Klaro] LLM grouping failed, using flat list:', error);
-    }
-
-    // Fall back to flat list if LLM fails
-    if (!groups) {
-      semanticTreeStore.initializeFlat(tree.url, tree.title, elements);
-      // Save to tab session cache
-      if (tabId) {
-        saveTabSession(tabId);
-      }
-      return;
-    }
-
-    // Initialize semantic tree with LLM-generated groups
-    await semanticTreeStore.initializeTree(
-      {
-        groups,
-        url: tree.url,
-        title: tree.title,
-        modalActive: false,
-        modalGroup: null,
-        version: 1,
-      },
-      elements
-    );
+    // Store tree directly - no LLM processing
+    domTreeStore.setTree(response.tree);
 
     // Save to tab session cache
     if (tabId) {
@@ -403,29 +308,29 @@
   async function scanCurrentTab(): Promise<void> {
     if (isOnCooldown) return;
 
-    semanticTreeStore.setLoading(true);
-    semanticTreeStore.setError(null);
+    domTreeStore.setLoading(true);
+    domTreeStore.setError(null);
     startCooldown();
 
     try {
       const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
 
       if (!tab?.id) {
-        semanticTreeStore.setError('No active tab found.');
+        domTreeStore.setError('No active tab found.');
         return;
       }
 
       await performScan(tab.id);
     } catch (e) {
-      semanticTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-      semanticTreeStore.reset();
+      domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+      domTreeStore.reset();
     } finally {
-      semanticTreeStore.setLoading(false);
+      domTreeStore.setLoading(false);
     }
   }
 
   async function handleUrlChange(newUrl: string): Promise<void> {
-    if (newUrl === semanticTreeStore.url) return;
+    if (newUrl === domTreeStore.url) return;
 
     if (urlChangeDebounceTimer) {
       clearTimeout(urlChangeDebounceTimer);
@@ -434,24 +339,24 @@
     urlChangeDebounceTimer = setTimeout(async () => {
       urlChangeDebounceTimer = null;
 
-      semanticTreeStore.setLoading(true);
-      semanticTreeStore.setError(null);
+      domTreeStore.setLoading(true);
+      domTreeStore.setError(null);
 
       try {
         const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
 
         if (!tab?.id) {
-          semanticTreeStore.setError('No active tab found.');
+          domTreeStore.setError('No active tab found.');
           return;
         }
 
-        semanticTreeStore.reset();
+        domTreeStore.reset();
         await performScan(tab.id);
       } catch (e) {
-        semanticTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-        semanticTreeStore.reset();
+        domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+        domTreeStore.reset();
       } finally {
-        semanticTreeStore.setLoading(false);
+        domTreeStore.setLoading(false);
       }
     }, URL_CHANGE_DEBOUNCE_MS);
   }
@@ -512,113 +417,56 @@
       message = { ...message, changes: filteredChanges };
     }
 
-    // Update form state in semantic tree store
-    semanticTreeStore.updateElementFormState(message.id, {
-      value: message.changes.value as string | undefined,
-      checked: message.changes.checked as boolean | undefined,
-      disabled: message.changes.disabled as boolean | undefined,
-      options: message.changes.options as
-        | Array<{ value: string; label: string; selected: boolean }>
-        | undefined,
-    });
+    // Update form state in tree store
+    domTreeStore.updateElementState(message.id, message.changes);
   }
 
   function handleElementRemoved(message: ElementRemovedMessage): void {
-    semanticTreeStore.removeElement(message.id);
+    domTreeStore.removeNode(message.id);
   }
 
   function handleInitialState(message: InitialStateMessage): void {
     for (const [elementId, state] of Object.entries(message.states)) {
-      semanticTreeStore.updateElementFormState(elementId, {
-        value: state.value as string | undefined,
-        checked: state.checked as boolean | undefined,
-        disabled: state.disabled as boolean | undefined,
-        options: state.options as
-          | Array<{ value: string; label: string; selected: boolean }>
-          | undefined,
-      });
+      domTreeStore.updateElementState(elementId, state);
     }
   }
 
   // Tree sync handlers
-  function handleNodeAdded(message: NodeAddedMessage): void {
-    const { node, neighborIds = [] } = message;
-
-    // Only add meaningful elements
-    if (node.nodeType !== 'interactive' && node.nodeType !== 'text' && node.nodeType !== 'media') {
-      return;
-    }
-
-    const elementData = nodeToElementData(node);
-    semanticTreeStore.addElement(elementData, neighborIds);
+  function handleNodeAdded(_message: NodeAddedMessage): void {
+    // For now, trigger a rescan on significant tree changes
+    // Full incremental update would require more complex tree manipulation
+    console.info('[Klaro] Node added - consider rescanning');
   }
 
   function handleNodeRemoved(message: NodeRemovedMessage): void {
-    const { nodeId } = message;
-    semanticTreeStore.removeElement(nodeId);
+    domTreeStore.removeNode(message.nodeId);
   }
 
   function handleNodeUpdated(message: NodeUpdatedMessage): void {
-    const { nodeId, changes } = message;
-    semanticTreeStore.updateElement(nodeId, changes as Partial<TrackedElementData>);
+    domTreeStore.updateNode(message.nodeId, message.changes);
   }
 
   function handleNodeMatched(message: NodeMatchedMessage): void {
-    const { nodeId, changes } = message;
-    // Element stays in its semantic group - just update any changed properties
-    semanticTreeStore.updateElement(nodeId, changes as Partial<TrackedElementData>);
+    domTreeStore.updateNode(message.nodeId, message.changes);
   }
 
-  async function handleTreeScanned(message: TreeScannedMessage): Promise<void> {
+  function handleTreeScanned(message: TreeScannedMessage): void {
     if (message.error || !message.tree) {
-      // Tree scan failed or not ready - will retry via performScan
       return;
     }
 
-    // Tree received from content script - process it
-    const elements = treeToElementMap(message.tree.root);
-
-    // Try to generate semantic groups via LLM
-    let groups: DisplayGroup[] | null = null;
-
-    try {
-      groups = await generateSemanticGroups(elements, message.tree.title, message.tree.url);
-    } catch (error) {
-      console.warn('[Klaro] LLM grouping failed, using flat list:', error);
-    }
-
-    // Fall back to flat list if LLM fails
-    if (!groups) {
-      semanticTreeStore.initializeFlat(message.tree.url, message.tree.title, elements);
-    } else {
-      semanticTreeStore.initializeTree(
-        {
-          groups,
-          url: message.tree.url,
-          title: message.tree.title,
-          modalActive: false,
-          modalGroup: null,
-          version: 1,
-        },
-        elements
-      );
-    }
-
-    semanticTreeStore.setLoading(false);
+    // Store tree directly - no LLM processing
+    domTreeStore.setTree(message.tree);
+    domTreeStore.setLoading(false);
   }
 
   function handleModalOpened(message: ModalOpenedMessage): void {
-    // Modal opened - switch to modal overlay mode
-    // For now, just log - full implementation would create modal group
     console.info('[Klaro] Modal opened:', message.modalId);
-    // TODO: Collect modal elements and call semanticTreeStore.enterModalOverlay()
+    // TODO: Implement modal focus mode if needed
   }
 
   function handleModalClosed(): void {
-    // Modal closed - exit overlay mode
-    if (semanticTreeStore.modalActive) {
-      semanticTreeStore.exitModalOverlay();
-    }
+    console.info('[Klaro] Modal closed');
   }
 
   // =============================================================================
@@ -657,8 +505,8 @@
     sendToActiveTab({ type: 'SCROLL_TO_ELEMENT', id: elementId });
   }
 
-  function handleToggleGroup(groupId: string): void {
-    semanticTreeStore.toggleGroup(groupId);
+  function handleToggleNode(nodeId: string): void {
+    domTreeStore.toggleNode(nodeId);
   }
 
   // =============================================================================
@@ -666,8 +514,8 @@
   // =============================================================================
 
   onMount(() => {
-    semanticTreeStore.setLoading(true);
-    semanticTreeStore.setError(null);
+    domTreeStore.setLoading(true);
+    domTreeStore.setError(null);
 
     const messageListener = (message: unknown) => {
       // Type guard for message validation
@@ -730,8 +578,8 @@
 
     browser.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
       if (!tab?.id) {
-        semanticTreeStore.setError('No active tab found.');
-        semanticTreeStore.setLoading(false);
+        domTreeStore.setError('No active tab found.');
+        domTreeStore.setLoading(false);
         isInitializing = false;
         return;
       }
@@ -741,10 +589,10 @@
       try {
         await performScan(tab.id);
       } catch (e) {
-        semanticTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-        semanticTreeStore.reset();
+        domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+        domTreeStore.reset();
       } finally {
-        semanticTreeStore.setLoading(false);
+        domTreeStore.setLoading(false);
         isInitializing = false;
       }
     });
@@ -777,20 +625,20 @@
       <h1 class="font-bold text-xl">Klaro</h1>
     </div>
     <div class="flex items-center gap-2">
-      {#if semanticTreeStore.tree}
+      {#if domTreeStore.tree}
         <Button
           variant="ghost"
           size="sm"
-          onclick={() => semanticTreeStore.expandAll()}
-          title="Expand all groups"
+          onclick={() => domTreeStore.expandAll()}
+          title="Expand all"
         >
           ↓↓
         </Button>
         <Button
           variant="ghost"
           size="sm"
-          onclick={() => semanticTreeStore.collapseAll()}
-          title="Collapse all groups"
+          onclick={() => domTreeStore.collapseAll()}
+          title="Collapse all"
         >
           ↑↑
         </Button>
@@ -799,7 +647,7 @@
         variant="outline"
         size="sm"
         onclick={() => scanCurrentTab()}
-        disabled={isOnCooldown || semanticTreeStore.loading}
+        disabled={isOnCooldown || domTreeStore.loading}
       >
         {#if isOnCooldown}
           {Math.ceil(cooldownRemaining / 1000)}s
@@ -812,7 +660,7 @@
 
   <!-- CONTENT -->
   <ScrollArea class="flex-1">
-    {#if semanticTreeStore.loading}
+    {#if domTreeStore.loading}
       <!-- Loading State -->
       <div class="p-4 space-y-4">
         <Skeleton class="h-8 w-3/4" />
@@ -829,13 +677,13 @@
           <Skeleton class="h-6 w-10/12 rounded ml-4" />
         </div>
       </div>
-    {:else if semanticTreeStore.error}
+    {:else if domTreeStore.error}
       <!-- Error State -->
       <div class="p-4">
         <Alert.Root variant="destructive">
           <Alert.Title>Unable to scan page</Alert.Title>
           <Alert.Description>
-            {semanticTreeStore.error}
+            {domTreeStore.error}
             <br /><br />
             Try refreshing the page or open a normal webpage (not chrome:// or extension pages).
           </Alert.Description>
@@ -853,29 +701,28 @@
           {/if}
         </Button>
       </div>
-    {:else if semanticTreeStore.tree}
-      <!-- Semantic Group View -->
-      <div class="groups-container">
-        {#if semanticTreeStore.title}
+    {:else if domTreeStore.root}
+      <!-- Tree View -->
+      <div class="tree-container">
+        {#if domTreeStore.title}
           <div class="p-4 pb-2">
-            <h2 class="text-lg font-semibold text-foreground">{semanticTreeStore.title}</h2>
+            <h2 class="text-lg font-semibold text-foreground">{domTreeStore.title}</h2>
             <p class="text-sm text-muted-foreground">
-              {semanticTreeStore.elementCount} elements in {semanticTreeStore.groupCount} groups
+              {domTreeStore.nodeCount} elements
             </p>
           </div>
           <Separator />
         {/if}
 
-        <GroupView
-          tree={semanticTreeStore.tree}
-          elements={semanticTreeStore.elements}
-          modalActive={semanticTreeStore.modalActive}
-          onToggleGroup={handleToggleGroup}
+        <TreeView
+          root={domTreeStore.root}
+          onToggle={handleToggleNode}
           onAction={handleUIAction}
           onInputChange={handleInputChange}
           onToggleCheckbox={handleToggle}
           onSelectChange={handleSelectChange}
           onScrollTo={handleScrollTo}
+          elementStates={domTreeStore.elementStates}
         />
       </div>
     {:else}
