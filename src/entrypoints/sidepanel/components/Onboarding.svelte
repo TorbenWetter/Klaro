@@ -1,324 +1,447 @@
 <script lang="ts">
-    import { Button } from "$lib/components/ui/button";
-    import * as Card from "$lib/components/ui/card";
-    import { Switch } from "$lib/components/ui/switch";
-    import { Label } from "$lib/components/ui/label";
-    import { Separator } from "$lib/components/ui/separator";
+  import { ChevronLeft, ChevronRight } from '@lucide/svelte';
+  import type {
+    AccessibilityPreferences,
+    FontSize,
+  } from '../../../utils/accessibility-preferences';
+  import {
+    DEFAULT_PREFERENCES,
+    applyPreferencesToDOM,
+    savePreferences,
+    setOnboardingComplete,
+  } from '../../../utils/accessibility-preferences';
 
-    // Settings that will be saved
-    export interface AccessibilitySettings {
-        fontSize: "small" | "medium" | "large" | "xlarge";
-        highContrast: boolean;
-        increasedSpacing: boolean;
-        reducedMotion: boolean;
+  interface Props {
+    onComplete: () => void;
+  }
+
+  let { onComplete }: Props = $props();
+
+  // Current step (0-indexed)
+  let step = $state(0);
+
+  // Preferences being configured
+  let preferences = $state<AccessibilityPreferences>({ ...DEFAULT_PREFERENCES });
+
+  // Steps configuration
+  const steps = [
+    { id: 'welcome', title: 'Welcome to Klaro' },
+    { id: 'fontSize', title: 'Which text size do you prefer?' },
+    { id: 'spacing', title: 'Which letter spacing do you prefer?' },
+    { id: 'contrast', title: 'Which contrast do you prefer?' },
+    { id: 'complete', title: "You're all set!" },
+  ];
+
+  const totalSteps = steps.length;
+  const currentStep = $derived(steps[step]);
+  const isFirstStep = $derived(step === 0);
+  const isLastStep = $derived(step === totalSteps - 1);
+
+  // Font size options
+  const fontSizeOptions: { value: FontSize; label: string; multiplier: string }[] = [
+    { value: 'medium', label: 'Normal Size', multiplier: '1x' },
+    { value: 'large', label: 'Large Size', multiplier: '1.2x' },
+    { value: 'xlarge', label: 'Huge Size', multiplier: '1.5x' },
+  ];
+
+  function goBack(): void {
+    if (step > 0) {
+      step--;
     }
+  }
 
-    interface Props {
-        onComplete: (settings: AccessibilitySettings) => void;
+  function goNext(): void {
+    if (step < totalSteps - 1) {
+      step++;
     }
+  }
 
-    let { onComplete }: Props = $props();
+  async function finish(): Promise<void> {
+    await savePreferences(preferences);
+    await setOnboardingComplete();
+    onComplete();
+  }
 
-    // Current step (1-3)
-    let step = $state(1);
+  function selectFontSize(size: FontSize): void {
+    preferences.fontSize = size;
+    applyPreferencesToDOM(preferences);
+  }
 
-    // Settings state
-    let fontSize = $state<AccessibilitySettings["fontSize"]>("medium");
-    let highContrast = $state(false);
-    let increasedSpacing = $state(false);
-    let reducedMotion = $state(false);
+  function selectSpacing(increased: boolean): void {
+    preferences.increasedSpacing = increased;
+    applyPreferencesToDOM(preferences);
+  }
 
-    // Font size config
-    const fontSizes = [
-        { value: "small", label: "Small", size: "14px" },
-        { value: "medium", label: "Medium", size: "16px" },
-        { value: "large", label: "Large", size: "18px" },
-        { value: "xlarge", label: "Extra Large", size: "20px" },
-    ] as const;
-
-    function nextStep() {
-        if (step < 3) {
-            step++;
-        }
-    }
-
-    function prevStep() {
-        if (step > 1) {
-            step--;
-        }
-    }
-
-    function finish() {
-        onComplete({
-            fontSize,
-            highContrast,
-            increasedSpacing,
-            reducedMotion,
-        });
-    }
-
-    // Get current font size in px for preview
-    const currentFontSize = $derived(fontSizes.find((f) => f.value === fontSize)?.size ?? "16px");
-
-    // Preview styles based on current settings
-    const previewStyles = $derived({
-        fontSize: currentFontSize,
-        lineHeight: increasedSpacing ? "1.8" : "1.5",
-        letterSpacing: increasedSpacing ? "0.02em" : "normal",
-    });
-
-    const previewContainerStyles = $derived({
-        background: highContrast ? "black" : undefined,
-        color: highContrast ? "white" : undefined,
-        border: highContrast ? "2px solid white" : undefined,
-    });
+  function selectContrast(high: boolean): void {
+    preferences.highContrast = high;
+    applyPreferencesToDOM(preferences);
+  }
 </script>
 
-<div class="h-full flex flex-col bg-background">
-    <!-- Header with progress -->
-    <header class="p-4 bg-card border-b">
-        <div class="flex items-center gap-2 mb-3">
-            <img
-                src="/Klaro_Logo_Yellow.svg"
-                alt="Klaro"
-                class="h-8 w-8 shrink-0 rounded"
-                width="32"
-                height="32"
-            />
-            <h1 class="font-bold text-lg">Welcome to Klaro</h1>
+<div class="onboarding">
+  <!-- Main content area (white/light) -->
+  <div class="content-area">
+    <!-- Step content -->
+    <div class="step-content">
+      {#if currentStep.id === 'welcome'}
+        <!-- Welcome Step -->
+        <div class="welcome-step">
+          <img src="/Klaro_Logo_Yellow.svg" alt="Klaro" class="logo" />
+          <h1 class="title">Welcome to Klaro</h1>
+          <p class="description">
+            Let's personalize your experience. We'll ask a few questions to make the sidebar easier
+            for you to use.
+          </p>
         </div>
-        <!-- Progress dots -->
-        <div class="flex items-center justify-center gap-2">
-            {#each [1, 2, 3] as s}
-                <div
-                    class="h-2 w-2 rounded-full transition-colors {s === step
-                        ? 'bg-brand'
-                        : s < step
-                          ? 'bg-brand/50'
-                          : 'bg-muted'}"
-                ></div>
-            {/each}
+      {:else if currentStep.id === 'fontSize'}
+        <!-- Font Size Step - title changes with selection -->
+        <h1
+          class="step-title"
+          style="font-size: {preferences.fontSize === 'medium'
+            ? '16px'
+            : preferences.fontSize === 'large'
+              ? '20px'
+              : '24px'}; transition: font-size 0.2s ease;"
+        >
+          {currentStep.title}
+        </h1>
+        <div class="options">
+          {#each fontSizeOptions as option}
+            <button
+              class="option-pill"
+              class:selected={preferences.fontSize === option.value}
+              onclick={() => selectFontSize(option.value)}
+            >
+              <span
+                class="option-label"
+                style="font-size: {option.value === 'medium'
+                  ? '16px'
+                  : option.value === 'large'
+                    ? '20px'
+                    : '24px'}"
+              >
+                {option.label} ({option.multiplier})
+              </span>
+            </button>
+          {/each}
         </div>
-    </header>
-
-    <!-- Content area -->
-    <div class="flex-1 overflow-auto p-4">
-        {#if step === 1}
-            <!-- Step 1: Font Size -->
-            <div class="space-y-4">
-                <div>
-                    <h2 class="text-xl font-semibold mb-1">Choose your font size</h2>
-                    <p class="text-sm text-muted-foreground">
-                        Select a comfortable reading size. You can change this later.
-                    </p>
-                </div>
-
-                <!-- Font size buttons -->
-                <div class="grid grid-cols-2 gap-2">
-                    {#each fontSizes as option}
-                        <button
-                            type="button"
-                            class="p-3 rounded-lg border-2 text-left transition-all {fontSize ===
-                            option.value
-                                ? 'border-brand bg-brand/10'
-                                : 'border-border hover:border-brand/50'}"
-                            onclick={() => (fontSize = option.value)}
-                        >
-                            <span class="block font-medium" style="font-size: {option.size}">
-                                {option.label}
-                            </span>
-                            <span class="text-xs text-muted-foreground">{option.size}</span>
-                        </button>
-                    {/each}
-                </div>
-
-                <Separator />
-
-                <!-- Live Preview -->
-                <div>
-                    <p class="text-sm font-medium mb-2 text-muted-foreground">Preview</p>
-                    <Card.Root>
-                        <Card.Content class="pt-4">
-                            <div style="font-size: {currentFontSize}; line-height: 1.5;">
-                                <p class="font-semibold mb-1">Page Title</p>
-                                <p class="text-muted-foreground">
-                                    This is how text will appear in Klaro. The quick brown fox jumps
-                                    over the lazy dog.
-                                </p>
-                            </div>
-                        </Card.Content>
-                    </Card.Root>
-                </div>
-            </div>
-        {:else if step === 2}
-            <!-- Step 2: Accessibility Features -->
-            <div class="space-y-4">
-                <div>
-                    <h2 class="text-xl font-semibold mb-1">Accessibility options</h2>
-                    <p class="text-sm text-muted-foreground">
-                        Enable features to make Klaro easier to use.
-                    </p>
-                </div>
-
-                <!-- Toggle options -->
-                <div class="space-y-3">
-                    <div
-                        class="flex items-center justify-between p-3 rounded-lg border bg-card"
-                    >
-                        <div class="space-y-0.5">
-                            <Label for="high-contrast" class="font-medium">High Contrast</Label>
-                            <p class="text-xs text-muted-foreground">
-                                Stronger colors for better visibility
-                            </p>
-                        </div>
-                        <Switch id="high-contrast" bind:checked={highContrast} />
-                    </div>
-
-                    <div
-                        class="flex items-center justify-between p-3 rounded-lg border bg-card"
-                    >
-                        <div class="space-y-0.5">
-                            <Label for="spacing" class="font-medium">Increased Spacing</Label>
-                            <p class="text-xs text-muted-foreground">
-                                More space between lines and letters
-                            </p>
-                        </div>
-                        <Switch id="spacing" bind:checked={increasedSpacing} />
-                    </div>
-
-                    <div
-                        class="flex items-center justify-between p-3 rounded-lg border bg-card"
-                    >
-                        <div class="space-y-0.5">
-                            <Label for="motion" class="font-medium">Reduced Motion</Label>
-                            <p class="text-xs text-muted-foreground">
-                                Minimize animations and transitions
-                            </p>
-                        </div>
-                        <Switch id="motion" bind:checked={reducedMotion} />
-                    </div>
-                </div>
-
-                <Separator />
-
-                <!-- Live Preview -->
-                <div>
-                    <p class="text-sm font-medium mb-2 text-muted-foreground">Preview</p>
-                    <Card.Root>
-                        <Card.Content class="pt-4">
-                            <div
-                                class="p-3 rounded {highContrast
-                                    ? 'bg-black text-white border-2 border-white'
-                                    : ''}"
-                                style="font-size: {currentFontSize}; line-height: {increasedSpacing
-                                    ? '1.8'
-                                    : '1.5'}; letter-spacing: {increasedSpacing
-                                    ? '0.02em'
-                                    : 'normal'};"
-                            >
-                                <p class="font-semibold mb-1">Sample Content</p>
-                                <p class={highContrast ? "text-white/80" : "text-muted-foreground"}>
-                                    Preview of your accessibility settings. Text spacing and contrast
-                                    are adjusted based on your choices.
-                                </p>
-                                <button
-                                    type="button"
-                                    class="mt-2 px-3 py-1.5 rounded text-sm font-medium {highContrast
-                                        ? 'bg-white text-black'
-                                        : 'bg-brand text-brand-foreground'}"
-                                    style={reducedMotion ? "transition: none;" : ""}
-                                >
-                                    Sample Button
-                                </button>
-                            </div>
-                        </Card.Content>
-                    </Card.Root>
-                </div>
-            </div>
-        {:else}
-            <!-- Step 3: All Set -->
-            <div class="space-y-6 text-center pt-8">
-                <div
-                    class="w-16 h-16 mx-auto bg-brand/20 rounded-full flex items-center justify-center"
-                >
-                    <svg
-                        class="w-8 h-8 text-brand-foreground"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                        stroke-width="2"
-                    >
-                        <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            d="M5 13l4 4L19 7"
-                        />
-                    </svg>
-                </div>
-
-                <div>
-                    <h2 class="text-xl font-semibold mb-2">You're all set!</h2>
-                    <p class="text-muted-foreground">
-                        Klaro will make web pages easier to navigate and understand.
-                    </p>
-                </div>
-
-                <!-- Summary -->
-                <Card.Root class="text-left">
-                    <Card.Header class="pb-2">
-                        <Card.Title class="text-base">Your Settings</Card.Title>
-                    </Card.Header>
-                    <Card.Content class="space-y-2 text-sm">
-                        <div class="flex justify-between">
-                            <span class="text-muted-foreground">Font Size</span>
-                            <span class="font-medium capitalize">{fontSize}</span>
-                        </div>
-                        <div class="flex justify-between">
-                            <span class="text-muted-foreground">High Contrast</span>
-                            <span class="font-medium">{highContrast ? "On" : "Off"}</span>
-                        </div>
-                        <div class="flex justify-between">
-                            <span class="text-muted-foreground">Increased Spacing</span>
-                            <span class="font-medium">{increasedSpacing ? "On" : "Off"}</span>
-                        </div>
-                        <div class="flex justify-between">
-                            <span class="text-muted-foreground">Reduced Motion</span>
-                            <span class="font-medium">{reducedMotion ? "On" : "Off"}</span>
-                        </div>
-                    </Card.Content>
-                </Card.Root>
-
-                <p class="text-xs text-muted-foreground">
-                    You can change these settings anytime from the menu.
-                </p>
-            </div>
-        {/if}
+      {:else if currentStep.id === 'spacing'}
+        <!-- Spacing Step - title changes with selection -->
+        <h1
+          class="step-title"
+          style="letter-spacing: {preferences.increasedSpacing
+            ? '0.1em'
+            : 'normal'}; transition: letter-spacing 0.2s ease;"
+        >
+          {currentStep.title}
+        </h1>
+        <div class="options">
+          <button
+            class="option-pill"
+            class:selected={!preferences.increasedSpacing}
+            onclick={() => selectSpacing(false)}
+          >
+            <span class="option-label">Normal Spacing</span>
+          </button>
+          <button
+            class="option-pill"
+            class:selected={preferences.increasedSpacing}
+            onclick={() => selectSpacing(true)}
+          >
+            <span class="option-label" style="letter-spacing: 0.1em;">Increased Spacing</span>
+          </button>
+        </div>
+      {:else if currentStep.id === 'contrast'}
+        <!-- Contrast Step - background changes with selection -->
+        <div
+          class="contrast-preview-area"
+          class:high-contrast={preferences.highContrast}
+          style="transition: background-color 0.2s ease, color 0.2s ease;"
+        >
+          <h1 class="step-title contrast-title">{currentStep.title}</h1>
+          <div class="options">
+            <button
+              class="option-pill"
+              class:selected={!preferences.highContrast}
+              class:contrast-pill={true}
+              onclick={() => selectContrast(false)}
+            >
+              <svg class="option-icon" viewBox="0 0 32 32" fill="none">
+                <circle cx="16" cy="16" r="11" stroke="currentColor" stroke-width="2" fill="none" />
+              </svg>
+              <span class="option-label">Normal Contrast</span>
+            </button>
+            <button
+              class="option-pill"
+              class:selected={preferences.highContrast}
+              class:contrast-pill={true}
+              onclick={() => selectContrast(true)}
+            >
+              <svg class="option-icon" viewBox="0 0 32 32" fill="none">
+                <circle cx="16" cy="16" r="10" fill="currentColor" />
+              </svg>
+              <span class="option-label">High Contrast</span>
+            </button>
+          </div>
+        </div>
+      {:else if currentStep.id === 'complete'}
+        <!-- Complete Step -->
+        <div class="complete-step">
+          <div class="checkmark">✓</div>
+          <h1 class="title">{currentStep.title}</h1>
+          <p class="description">Your preferences have been saved. You can change them anytime.</p>
+        </div>
+      {/if}
     </div>
+  </div>
 
-    <!-- Footer with navigation -->
-    <footer class="p-4 bg-card border-t flex justify-between items-center">
-        {#if step > 1}
-            <Button variant="ghost" size="sm" onclick={prevStep}>Back</Button>
-        {:else}
-            <div></div>
-        {/if}
+  <!-- Footer (dark bar) -->
+  <div class="footer">
+    {#if !isFirstStep}
+      <button class="nav-btn" onclick={goBack}>
+        <ChevronLeft size={20} strokeWidth={2} />
+        <span>Back</span>
+      </button>
+    {:else}
+      <div></div>
+    {/if}
 
-        {#if step < 3}
-            <Button
-                class="bg-brand text-brand-foreground hover:bg-brand/90"
-                size="sm"
-                onclick={nextStep}
-            >
-                Continue
-            </Button>
-        {:else}
-            <Button
-                class="bg-brand text-brand-foreground hover:bg-brand/90"
-                size="sm"
-                onclick={finish}
-            >
-                Get Started
-            </Button>
-        {/if}
-    </footer>
+    {#if isLastStep}
+      <button class="nav-btn primary" onclick={finish}>
+        <span>Get Started</span>
+      </button>
+    {:else}
+      <button class="nav-btn" onclick={goNext}>
+        <span>Next</span>
+        <ChevronRight size={20} strokeWidth={2} />
+      </button>
+    {/if}
+  </div>
 </div>
+
+<style>
+  .onboarding {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    background: #ffffff;
+  }
+
+  /* Content area (white background) */
+  .content-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Step content */
+  .step-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    padding: 24px;
+  }
+
+  /* When contrast step, remove padding so preview area fills */
+  .step-content:has(.contrast-preview-area) {
+    padding: 0;
+  }
+
+  .step-title {
+    font-size: 16px;
+    font-weight: 300;
+    color: #000000;
+    text-align: center;
+    margin-bottom: 48px;
+  }
+
+  /* Welcome step */
+  .welcome-step,
+  .complete-step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    text-align: center;
+  }
+
+  .logo {
+    width: 64px;
+    height: 64px;
+    margin-bottom: 8px;
+  }
+
+  .title {
+    font-size: 24px;
+    font-weight: 500;
+    color: #000000;
+    margin: 0;
+  }
+
+  .description {
+    font-size: 16px;
+    color: #666666;
+    max-width: 280px;
+    line-height: 1.5;
+  }
+
+  /* Options list */
+  .options {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    width: 100%;
+    max-width: 280px;
+  }
+
+  /* Pill-shaped option buttons */
+  .option-pill {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px 24px;
+    border: 2px solid #8b8b8b;
+    border-radius: 999px;
+    background: none;
+    color: #8b8b8b;
+    font-family: inherit;
+    cursor: pointer;
+    transition:
+      border-color 0.15s,
+      color 0.15s;
+  }
+
+  .option-pill:hover {
+    border-color: #666666;
+    color: #666666;
+  }
+
+  .option-pill.selected {
+    border-color: #000000;
+    color: #000000;
+  }
+
+  .option-icon {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+  }
+
+  .option-label {
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  /* Contrast preview area - changes background with selection */
+  .contrast-preview-area {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    padding: 24px;
+    background: #ffffff;
+    border-radius: 0;
+  }
+
+  .contrast-preview-area.high-contrast {
+    background: #000000;
+  }
+
+  .contrast-preview-area .step-title {
+    color: #000000;
+  }
+
+  .contrast-preview-area.high-contrast .step-title {
+    color: #ffffff;
+  }
+
+  .contrast-preview-area .option-pill.contrast-pill {
+    border-color: #8b8b8b;
+    color: #8b8b8b;
+  }
+
+  .contrast-preview-area .option-pill.contrast-pill:hover {
+    border-color: #666666;
+    color: #666666;
+  }
+
+  .contrast-preview-area .option-pill.contrast-pill.selected {
+    border-color: #000000;
+    color: #000000;
+  }
+
+  .contrast-preview-area.high-contrast .option-pill.contrast-pill {
+    border-color: #666666;
+    color: #666666;
+  }
+
+  .contrast-preview-area.high-contrast .option-pill.contrast-pill:hover {
+    border-color: #999999;
+    color: #999999;
+  }
+
+  .contrast-preview-area.high-contrast .option-pill.contrast-pill.selected {
+    border-color: #ffffff;
+    color: #ffffff;
+  }
+
+  /* Complete step */
+  .checkmark {
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    background: #22c55e;
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 32px;
+    font-weight: bold;
+    margin-bottom: 8px;
+  }
+
+  /* Footer (dark bar) */
+  .footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 24px;
+    padding-bottom: 48px;
+    background: #000000;
+  }
+
+  .nav-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+    background: transparent;
+    border: none;
+    color: #ffffff;
+    font-family: inherit;
+    font-size: 16px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .nav-btn:hover {
+    opacity: 0.8;
+  }
+
+  .nav-btn.primary {
+    background: var(--brand, #e9ff70);
+    color: #000000;
+    padding: 12px 24px;
+    border-radius: 8px;
+  }
+
+  .nav-btn.primary:hover {
+    opacity: 0.9;
+  }
+</style>
