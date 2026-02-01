@@ -288,7 +288,14 @@
   /**
    * Convert DOMTreeNode to TrackedElementData
    */
-  function nodeToElementData(node: DOMTreeNode): TrackedElementData {
+  function nodeToElementData(
+    node: DOMTreeNode & {
+      value?: string;
+      checked?: boolean;
+      disabled?: boolean;
+      options?: Array<{ value: string; label: string; selected: boolean }>;
+    }
+  ): TrackedElementData {
     return {
       id: node.id,
       fingerprint: node.fingerprint,
@@ -301,6 +308,13 @@
       placeholder: node.placeholder,
       headingLevel: node.headingLevel,
       altText: node.altText,
+      // Extract form state from node (stored flat on TreeNode, nested in TrackedElementData)
+      formState: {
+        value: node.value,
+        checked: node.checked,
+        disabled: node.disabled,
+        options: node.options,
+      },
     };
   }
 

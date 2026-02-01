@@ -182,13 +182,25 @@
                       use:setInitialValue={element.formState?.value}
                     ></textarea>
                   </div>
-                {:else if element.interactiveType === 'checkbox' || element.interactiveType === 'radio'}
+                {:else if element.interactiveType === 'checkbox'}
                   <div class="checkbox-wrapper">
                     <Checkbox
                       checked={element.formState?.checked ?? false}
                       onCheckedChange={(checked) => onToggleCheckbox(element.id, Boolean(checked))}
                     />
                     <button class="checkbox-label" onclick={() => onScrollTo(element.id)}>
+                      {truncate(element.label)}
+                    </button>
+                  </div>
+                {:else if element.interactiveType === 'radio'}
+                  <div class="radio-wrapper">
+                    <input
+                      type="radio"
+                      class="radio-input"
+                      checked={element.formState?.checked ?? false}
+                      onchange={() => onToggleCheckbox(element.id, true)}
+                    />
+                    <button class="radio-label" onclick={() => onScrollTo(element.id)}>
                       {truncate(element.label)}
                     </button>
                   </div>
@@ -444,6 +456,49 @@
   }
 
   .checkbox-label:hover {
+    text-decoration: underline;
+  }
+
+  .radio-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 8px;
+  }
+
+  .radio-input {
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border: 1px solid hsl(var(--input));
+    border-radius: 50%;
+    background: hsl(var(--background));
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .radio-input:checked {
+    border-color: hsl(var(--primary));
+    background: hsl(var(--primary));
+    box-shadow: inset 0 0 0 3px hsl(var(--background));
+  }
+
+  .radio-input:focus-visible {
+    outline: none;
+    ring: 2px solid hsl(var(--ring));
+  }
+
+  .radio-label {
+    background: none;
+    border: none;
+    cursor: pointer;
+    text-align: left;
+    font-size: 14px;
+    color: hsl(var(--foreground));
+    padding: 0;
+  }
+
+  .radio-label:hover {
     text-decoration: underline;
   }
 

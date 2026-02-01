@@ -197,7 +197,7 @@
                 : undefined}
             ></textarea>
           </div>
-        {:else if node.interactiveType === 'checkbox' || node.interactiveType === 'radio'}
+        {:else if node.interactiveType === 'checkbox'}
           <div class="checkbox-wrapper">
             <Checkbox
               checked={typeof getStateValue('checked') === 'boolean'
@@ -206,6 +206,20 @@
               onCheckedChange={(checked) => onToggleCheckbox(node.id, Boolean(checked))}
             />
             <button class="checkbox-label" onclick={handleLabelClick}>
+              {truncate(node.label)}
+            </button>
+          </div>
+        {:else if node.interactiveType === 'radio'}
+          <div class="radio-wrapper">
+            <input
+              type="radio"
+              class="radio-input"
+              checked={typeof getStateValue('checked') === 'boolean'
+                ? (getStateValue('checked') as boolean)
+                : false}
+              onchange={() => onToggleCheckbox(node.id, true)}
+            />
+            <button class="radio-label" onclick={handleLabelClick}>
               {truncate(node.label)}
             </button>
           </div>
@@ -513,6 +527,48 @@
   }
 
   .checkbox-label:hover {
+    text-decoration: underline;
+  }
+
+  .radio-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .radio-input {
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border: 1px solid hsl(var(--input));
+    border-radius: 50%;
+    background: hsl(var(--background));
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .radio-input:checked {
+    border-color: hsl(var(--primary));
+    background: hsl(var(--primary));
+    box-shadow: inset 0 0 0 3px hsl(var(--background));
+  }
+
+  .radio-input:focus-visible {
+    outline: none;
+    ring: 2px solid hsl(var(--ring));
+  }
+
+  .radio-label {
+    background: none;
+    border: none;
+    cursor: pointer;
+    text-align: left;
+    font-size: 14px;
+    color: hsl(var(--foreground));
+    padding: 0;
+  }
+
+  .radio-label:hover {
     text-decoration: underline;
   }
 

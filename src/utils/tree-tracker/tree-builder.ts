@@ -507,6 +507,16 @@ function shouldSkipElement(element: HTMLElement, nodeType: NodeType): boolean {
  * Used for buttons, links, and other interactive elements.
  */
 function extractConsolidatedLabel(element: HTMLElement): string {
+  // For form fields (inputs, textareas, selects), use the specialized extractor
+  // This handles <label for="id">, wrapping <label>, fieldset legends, etc.
+  if (
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLSelectElement
+  ) {
+    return extractFormFieldLabel(element);
+  }
+
   // First check aria-labelledby (highest priority)
   const labelledBy = element.getAttribute('aria-labelledby');
   if (labelledBy) {
