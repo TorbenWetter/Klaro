@@ -200,6 +200,25 @@ export function isHidden(element: HTMLElement): boolean {
 }
 
 /**
+ * Check if an element is a Klaro-injected element (Leichte Sprache badges, tooltips, etc.)
+ * Checks both the element itself and all ancestors for klaro-* classes.
+ */
+function isKlaroElement(element: HTMLElement): boolean {
+  let current: HTMLElement | null = element;
+  while (current) {
+    if (
+      current.className &&
+      typeof current.className === 'string' &&
+      current.className.split(' ').some((c) => c.startsWith('klaro-'))
+    ) {
+      return true;
+    }
+    current = current.parentElement;
+  }
+  return false;
+}
+
+/**
  * Check if element is in the visible viewport.
  */
 export function isInViewport(element: HTMLElement): boolean {
@@ -848,11 +867,8 @@ export function buildDOMTree(
 
     // Skip Klaro-injected elements (Leichte Sprache badges, tooltips, etc.)
     // These are UI elements injected by Klaro, not page content
-    if (
-      element.className &&
-      typeof element.className === 'string' &&
-      element.className.split(' ').some((c) => c.startsWith('klaro-'))
-    ) {
+    // Check both the element itself AND its ancestors
+    if (isKlaroElement(element)) {
       return null;
     }
 
