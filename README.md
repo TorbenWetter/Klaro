@@ -1,55 +1,87 @@
 # Klaro
 
-An accessibility sidecar browser extension built with **WXT** and **Svelte**. It helps users (especially seniors) by:
+![Cursor 2-Day AI Hackathon](https://ai-beavers.com/_next/image?url=%2Fimages%2Fhackathon-hero-20012026.png&w=1920&q=75)
 
-- **Read**: Extracts main article content with Mozilla Readability and shows a simple summary.
-- **Do**: Lists interactive elements (buttons, links, inputs) and lets you trigger them from the side panel with one click (high-contrast, Neo-Brutalism style).
+> AI-powered browser extension that makes the web accessible for everyone.
 
-## Tech stack
+---
 
-- **WXT** – extension tooling (HMR, Manifest v3, side panel)
-- **Svelte 5** – small, fast UI
-- **Tailwind CSS** – high-contrast styling
-- **@mozilla/readability** – article extraction
+## The Problem
 
-## Setup
+**1.3 billion people globally live with a disability that affects how they use the internet.** That's 16% of the world's population. Despite this, 95% of the top million websites still fail basic accessibility standards.
+
+This isn't just a social failure — it's a massive business leak. **86% of users with disabilities leave a site immediately if it's not accessible**, representing over $13 trillion in purchasing power walking away.
+
+## The Solution
+
+**Klaro puts the power back in the user's hands.** Instead of waiting for websites to fix themselves, Klaro stores your individual needs in a personal profile. Whether you have low vision, dyslexia, or motor impairments, our AI automatically re-renders every site you visit in real-time.
+
+We offer **ambient personalization** that adapts the web to you — not the other way around.
+
+### Key Features
+
+- **Personal Accessibility Profile** — Set your preferences once, apply everywhere
+- **AI-Powered Re-rendering** — Automatically transforms any website to match your needs
+- **Real-time Adaptation** — Works instantly as you browse
+- **Onboarding Flow** — Simple setup for font size, spacing, and contrast preferences
+
+## Tech Stack
+
+- **Extension Framework**: [WXT](https://wxt.dev/) (Manifest v3, HMR, side panel)
+- **Frontend**: [Svelte 5](https://svelte.dev/) + [Tailwind CSS](https://tailwindcss.com/)
+- **UI Components**: [shadcn-svelte](https://shadcn-svelte.com/) + [Bits UI](https://bits-ui.com/)
+- **AI/ML**: [Google Gemini API](https://ai.google.dev/gemini-api/docs)
+- **Content Extraction**: [@mozilla/readability](https://github.com/mozilla/readability)
+
+## How to Run
 
 ```bash
+# Clone the repo
+git clone https://github.com/TorbenWetter/Klaro.git
+cd Klaro
+
+# Install dependencies
 pnpm install
-```
 
-Copy `.env.example` to `.env` and set your Gemini API key (get one at [Google AI Studio](https://aistudio.google.com/app/apikey)):
-
-```bash
+# Set up environment variables
 cp .env.example .env
-# Edit .env and set VITE_GEMINI_API_KEY=your_key
-```
+# Add your Gemini API key to .env (get one at https://aistudio.google.com/app/apikey)
 
-If you hit pnpm store location errors, use your normal store or run `pnpm install` from the project root after fixing store config.
-
-## Development
-
-```bash
+# Run the development server
 pnpm dev
 ```
 
-Load the extension from `.output/chrome-mv3` (or the path WXT prints). Click the extension icon to open the **side panel** (no popup). The side panel scans the active tab on open and lets you switch between **Read** and **Do** modes.
+Load the extension from `.output/chrome-mv3-dev` in Chrome's extension page (`chrome://extensions` with Developer mode enabled).
 
-## Build
+## Business Model
 
-```bash
-pnpm build
-pnpm zip   # optional: pack for store
-```
+**Freemium approach:**
 
-## Project structure
+| Tier        | Price    | Features                                                           |
+| ----------- | -------- | ------------------------------------------------------------------ |
+| **Free**    | $0       | 100 screen-readings per week                                       |
+| **Premium** | $4.99/mo | Unlimited use, ad-blocker, AI-translation to easy-to-read language |
 
-- `src/entrypoints/background.ts` – opens side panel on action click
-- `src/entrypoints/content.ts` – runs on pages; handles `SCAN_PAGE` and `CLICK_ELEMENT` messages
-- `src/entrypoints/sidepanel/` – Svelte UI (Read/Do tabs, article summary, action buttons)
-- `src/utils/dom-scanner.ts` – Readability + TreeWalker for article and interactive elements
-- `src/utils/llm-service.ts` – stub for future LLM summary/priority (replace with OpenAI/Gemini when ready)
+## Go-To-Market Strategy
 
-## Recommended IDE
+We're taking a **human-first** approach:
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode).
+1. **Power of 10** — Friends and family validation
+2. **Power of 100** — Meeting elderly and disabled communities where they are
+3. **Scale** — Targeted Google Ads for global reach
+
+## Team
+
+We are a diverse team of strategists and engineers with over 30 years of combined experience in product development.
+
+**Ben, Dennis, Max, Torben**
+
+## Why We Built This
+
+The digital world was built for the young and fit, leaving the elderly and disabled behind. At Klaro, we believe it's time to change that.
+
+**We're making the web _klar_ for everyone.**
+
+---
+
+_Built at the [Cursor 2-Day AI Hackathon](https://ai-beavers.com) in Hamburg (31.1 – 1.2.2025)_
