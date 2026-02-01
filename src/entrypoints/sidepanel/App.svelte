@@ -4,8 +4,7 @@
     import type { ActionBinding, UINode } from "$lib/schemas/accessible-ui";
     import { onDestroy, onMount } from "svelte";
     import type { ElementState } from "../../utils/binding-manager";
-    import type { ArticleResult, ScannedAction, ScanResult } from "../../utils/dom-scanner";
-    import { getLLMSimplification } from "../../utils/llm-service";
+    import type { ScannedAction, ScanResult } from "../../utils/dom-scanner";
     import { convertPageToUIWithCache, convertSubtreeToUI, type AccessibleUI } from "../../utils/page-to-ui";
     import type {
         ContentToSidepanelMessage,
@@ -20,12 +19,11 @@
     import * as Alert from "$lib/components/ui/alert";
     import { Badge } from "$lib/components/ui/badge";
     import { Button } from "$lib/components/ui/button";
-    import * as Card from "$lib/components/ui/card";
     import { ScrollArea } from "$lib/components/ui/scroll-area";
     import { Separator } from "$lib/components/ui/separator";
     import { Skeleton } from "$lib/components/ui/skeleton";
-    import * as Tabs from "$lib/components/ui/tabs";
-    import { BookOpen, Accessibility } from "@lucide/svelte";
+    // Onboarding
+    import Onboarding, { type AccessibilitySettings } from "./components/Onboarding.svelte";
 
     // Constants
     const COOLDOWN_MS = 10_000;
@@ -33,16 +31,61 @@
     const COOLDOWN_UPDATE_INTERVAL_MS = 100;
     const URL_CHANGE_DEBOUNCE_MS = 500;
 
+    // Onboarding & settings state
+    let showOnboarding = $state<boolean | null>(null); // null = loading
+    let settings = $state<AccessibilitySettings>({
+        fontSize: "medium",
+        highContrast: false,
+        increasedSpacing: false,
+        reducedMotion: false,
+    });
+
+    // Font size mapping
+    const fontSizeMap = {
+        small: "14px",
+        medium: "16px",
+        large: "18px",
+        xlarge: "20px",
+    };
+
+    // Apply settings as CSS custom properties
+    function applySettings(s: AccessibilitySettings) {
+        const root = document.documentElement;
+        root.style.setProperty("--klaro-font-size", fontSizeMap[s.fontSize]);
+        root.style.setProperty("--klaro-line-height", s.increasedSpacing ? "1.8" : "1.5");
+        root.style.setProperty("--klaro-letter-spacing", s.increasedSpacing ? "0.02em" : "normal");
+
+        if (s.highContrast) {
+            root.classList.add("high-contrast");
+        } else {
+            root.classList.remove("high-contrast");
+        }
+
+        if (s.reducedMotion) {
+            root.classList.add("reduced-motion");
+        } else {
+            root.classList.remove("reduced-motion");
+        }
+    }
+
+    // Save settings to storage
+    async function saveSettings(s: AccessibilitySettings) {
+        await browser.storage.local.set({ klaroSettings: s, onboardingComplete: true });
+        settings = s;
+        applySettings(s);
+    }
+
+    // Handle onboarding completion
+    async function handleOnboardingComplete(newSettings: AccessibilitySettings) {
+        await saveSettings(newSettings);
+        showOnboarding = false;
+    }
+
     // UI state
-    let activeTab = $state("accessible");
     let loading = $state(false);
     let scanError = $state<string | null>(null);
     let accessibleUI = $state<AccessibleUI | null>(null);
     let currentUrl = $state("");
-
-    // Read mode state
-    let article = $state<ArticleResult | null>(null);
-    let simplifiedSummary = $state("");
 
     // Cooldown state
     let lastScanTime = $state(0);
@@ -66,7 +109,6 @@
 
     // Derived state
     const isOnCooldown = $derived(cooldownRemaining > 0);
-    const pendingCount = $derived(changeQueue.filter((c) => c.status === "pending").length);
 
     /**
      * Sends a message to the active tab's content script
@@ -163,8 +205,6 @@
      */
     function resetScanState(): void {
         accessibleUI = null;
-        article = null;
-        simplifiedSummary = "";
         changeQueue = [];
         elementStates = new Map();
     }
@@ -455,16 +495,7 @@
             return;
         }
 
-        article = response.article ?? null;
-
-        // Generate accessible UI and summary in parallel
-        const [ui, llmResult] = await Promise.all([
-            convertPageToUIWithCache(response, url),
-            getLLMSimplification(response.article, response.actions),
-        ]);
-
-        accessibleUI = ui;
-        simplifiedSummary = llmResult.summary;
+        accessibleUI = await convertPageToUIWithCache(response, url);
 
         // Start reactive tracking with the scanned actions
         if (response.actions.length > 0) {
@@ -546,8 +577,18 @@
     }
 
     onMount(() => {
-        loading = true;
-        scanError = null;
+        // Load settings and check onboarding status first
+        browser.storage.local.get(["klaroSettings", "onboardingComplete"]).then((result) => {
+            if (result.onboardingComplete && result.klaroSettings) {
+                settings = result.klaroSettings as AccessibilitySettings;
+                applySettings(settings);
+                showOnboarding = false;
+                // Proceed with scanning
+                initializeScan();
+            } else {
+                showOnboarding = true;
+            }
+        });
 
         // Listen for messages from content script
         const messageListener = (message: any) => {
@@ -573,30 +614,37 @@
 
         browser.tabs.onUpdated.addListener(tabUpdateListener);
 
-        browser.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
-            if (!tab?.id) {
-                scanError = "No active tab found.";
-                loading = false;
-                return;
-            }
-
-            currentUrl = tab.url ?? "";
-
-            try {
-                await performScan(tab.id, currentUrl);
-            } catch (e) {
-                scanError = e instanceof Error ? e.message : "Could not scan this page.";
-                resetScanState();
-            } finally {
-                loading = false;
-            }
-        });
-
         return () => {
             browser.runtime.onMessage.removeListener(messageListener);
             browser.tabs.onUpdated.removeListener(tabUpdateListener);
         };
     });
+
+    /**
+     * Initialize scanning after onboarding is complete
+     */
+    async function initializeScan() {
+        loading = true;
+        scanError = null;
+
+        const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+        if (!tab?.id) {
+            scanError = "No active tab found.";
+            loading = false;
+            return;
+        }
+
+        currentUrl = tab.url ?? "";
+
+        try {
+            await performScan(tab.id, currentUrl);
+        } catch (e) {
+            scanError = e instanceof Error ? e.message : "Could not scan this page.";
+            resetScanState();
+        } finally {
+            loading = false;
+        }
+    }
 
     onDestroy(() => {
         if (cooldownIntervalId) clearInterval(cooldownIntervalId);
@@ -607,9 +655,25 @@
     });
 </script>
 
-<main class="h-screen flex flex-col bg-background text-foreground">
-    <!-- HEADER -->
-    <header class="p-4 bg-card border-b flex justify-between items-center sticky top-0 z-10">
+{#if showOnboarding === null}
+    <!-- Loading settings -->
+    <div class="h-screen flex items-center justify-center bg-background">
+        <div class="text-center">
+            <img src="/Klaro_Logo_Yellow.svg" alt="Klaro" class="h-12 w-12 mx-auto mb-3 animate-pulse" />
+            <p class="text-muted-foreground text-sm">Loading...</p>
+        </div>
+    </div>
+{:else if showOnboarding}
+    <!-- Onboarding Flow -->
+    <Onboarding onComplete={async (s) => { await handleOnboardingComplete(s); initializeScan(); }} />
+{:else}
+    <!-- Main App -->
+    <main
+        class="h-screen flex flex-col bg-background text-foreground"
+        style="font-size: var(--klaro-font-size, 16px); line-height: var(--klaro-line-height, 1.5); letter-spacing: var(--klaro-letter-spacing, normal);"
+    >
+        <!-- HEADER -->
+        <header class="p-4 bg-card border-b flex justify-between items-center sticky top-0 z-10">
         <div class="flex items-center gap-2">
             <img src="/Klaro_Logo_Yellow.svg" alt="Klaro" class="h-9 w-9 shrink-0 rounded" width="36" height="36" />
             <h1 class="font-bold text-xl">Klaro</h1>
@@ -617,7 +681,13 @@
                 <Badge variant="secondary" class="text-xs">Live</Badge>
             {/if}
         </div>
-        <Button variant="outline" size="sm" onclick={() => scanCurrentTab()} disabled={isOnCooldown || loading}>
+        <Button
+            variant="outline"
+            size="sm"
+            class="bg-brand text-brand-foreground border-brand hover:bg-brand/90 hover:opacity-90"
+            onclick={() => scanCurrentTab()}
+            disabled={isOnCooldown || loading}
+        >
             {#if isOnCooldown}
                 {Math.ceil(cooldownRemaining / 1000)}s
             {:else}
@@ -635,121 +705,70 @@
         onRejectAll={rejectAllChanges}
     />
 
-    <!-- TABS -->
-    <Tabs.Root bind:value={activeTab} class="flex-1 flex flex-col">
-        <Tabs.List class="grid w-full grid-cols-2 rounded-none border-b">
-            <Tabs.Trigger value="read" class="rounded-none data-[state=active]:bg-primary data-[state=active]:text-primary-foreground flex items-center justify-center gap-2">
-                <BookOpen size={16} aria-hidden="true" />
-                Read
-            </Tabs.Trigger>
-            <Tabs.Trigger value="accessible" class="rounded-none data-[state=active]:bg-primary data-[state=active]:text-primary-foreground flex items-center justify-center gap-2">
-                <Accessibility size={16} aria-hidden="true" />
-                Accessible
-                {#if pendingCount > 0}
-                    <Badge variant="destructive" class="ml-1 text-xs h-5 px-1.5">
-                        {pendingCount}
-                    </Badge>
-                {/if}
-            </Tabs.Trigger>
-        </Tabs.List>
-
-        <ScrollArea class="flex-1">
-            <div class="p-4">
-                {#if loading}
-                    <!-- Loading State -->
-                    <div class="space-y-4">
-                        <Skeleton class="h-8 w-3/4" />
-                        <Skeleton class="h-4 w-full" />
-                        <Skeleton class="h-4 w-full" />
-                        <Skeleton class="h-4 w-2/3" />
-                        <Separator class="my-4" />
-                        <Skeleton class="h-32 w-full rounded-lg" />
-                        <div class="flex gap-2 pt-4">
-                            <Skeleton class="h-10 w-28 rounded-md" />
-                            <Skeleton class="h-10 w-28 rounded-md" />
-                        </div>
+    <!-- ACCESSIBILITY VIEW (full page, no tabs) -->
+    <ScrollArea class="flex-1">
+        <div class="p-4">
+            {#if loading}
+                <!-- Loading State -->
+                <div class="space-y-4">
+                    <Skeleton class="h-8 w-3/4" />
+                    <Skeleton class="h-4 w-full" />
+                    <Skeleton class="h-4 w-full" />
+                    <Skeleton class="h-4 w-2/3" />
+                    <Separator class="my-4" />
+                    <Skeleton class="h-32 w-full rounded-lg" />
+                    <div class="flex gap-2 pt-4">
+                        <Skeleton class="h-10 w-28 rounded-md" />
+                        <Skeleton class="h-10 w-28 rounded-md" />
                     </div>
-                {:else if scanError}
-                    <!-- Error State -->
-                    <Alert.Root variant="destructive">
-                        <Alert.Title>Unable to scan page</Alert.Title>
-                        <Alert.Description>
-                            {scanError}
-                            <br /><br />
-                            Try refreshing the page or open a normal webpage (not chrome:// or extension pages).
-                        </Alert.Description>
-                    </Alert.Root>
-                    <Button variant="outline" class="mt-4" onclick={() => scanCurrentTab()} disabled={isOnCooldown}>
-                        {#if isOnCooldown}
-                            Wait {Math.ceil(cooldownRemaining / 1000)}s
-                        {:else}
-                            Try again
-                        {/if}
-                    </Button>
-                {:else}
-                    <!-- READ TAB -->
-                    <Tabs.Content value="read" class="mt-0">
-                        {#if article}
-                            <div class="space-y-4">
-                                <h2 class="text-2xl font-bold leading-tight">{article.title}</h2>
-
-                                <Card.Root>
-                                    <Card.Header>
-                                        <Card.Title class="text-base">Summary</Card.Title>
-                                    </Card.Header>
-                                    <Card.Content>
-                                        <p class="text-base leading-relaxed">{simplifiedSummary}</p>
-                                    </Card.Content>
-                                </Card.Root>
-
-                                <Separator />
-
-                                <p class="text-base leading-relaxed whitespace-pre-wrap">
-                                    {article.textContent}
-                                </p>
+                </div>
+            {:else if scanError}
+                <!-- Error State -->
+                <Alert.Root variant="destructive">
+                    <Alert.Title>Unable to scan page</Alert.Title>
+                    <Alert.Description>
+                        {scanError}
+                        <br /><br />
+                        Try refreshing the page or open a normal webpage (not chrome:// or extension pages).
+                    </Alert.Description>
+                </Alert.Root>
+                <Button variant="outline" class="mt-4" onclick={() => scanCurrentTab()} disabled={isOnCooldown}>
+                    {#if isOnCooldown}
+                        Wait {Math.ceil(cooldownRemaining / 1000)}s
+                    {:else}
+                        Try again
+                    {/if}
+                </Button>
+            {:else if accessibleUI}
+                <!-- Short summary at top, then full accessibility view -->
+                <article aria-label="Accessible version of this page">
+                    <div class="accessible-ui-container">
+                        {#if accessibleUI.title || accessibleUI.description}
+                            <div class="pb-4 mb-4 border-b">
+                                {#if accessibleUI.title}
+                                    <h2 class="text-lg font-semibold text-foreground">{accessibleUI.title}</h2>
+                                {/if}
+                                {#if accessibleUI.description}
+                                    <p class="text-sm text-muted-foreground mt-1">{accessibleUI.description}</p>
+                                {/if}
                             </div>
-                        {:else}
-                            <Card.Root>
-                                <Card.Content class="pt-6 text-center">
-                                    <p class="text-muted-foreground">No article text found on this page.</p>
-                                    <Button variant="link" class="mt-2" onclick={() => (activeTab = "accessible")}>
-                                        View accessible version instead
-                                    </Button>
-                                </Card.Content>
-                            </Card.Root>
                         {/if}
-                    </Tabs.Content>
-
-                    <!-- ACCESSIBLE TAB -->
-                    <Tabs.Content value="accessible" class="mt-0">
-                        <article aria-label="Accessible version of this page">
-                            {#if accessibleUI}
-                                <div class="accessible-ui-container">
-                                    {#if accessibleUI.title}
-                                        <h1 class="text-2xl font-bold mb-2">{accessibleUI.title}</h1>
-                                    {/if}
-                                    {#if accessibleUI.description}
-                                        <p class="text-muted-foreground mb-4">{accessibleUI.description}</p>
-                                    {/if}
-                                    <UIRenderer
-                                        nodes={accessibleUI.nodes}
-                                        onAction={handleUIAction}
-                                        onInputChange={handleInputChange}
-                                        onToggle={handleToggle}
-                                        onSelectChange={handleSelectChange}
-                                    />
-                                </div>
-                            {:else}
-                                <Alert.Root>
-                                    <Alert.Title>Unable to generate view</Alert.Title>
-                                    <Alert.Description>Could not create an accessible version of this page. Try refreshing.</Alert.Description>
-                                </Alert.Root>
-                            {/if}
-                        </article>
-                    </Tabs.Content>
-
-                {/if}
-            </div>
-        </ScrollArea>
-    </Tabs.Root>
+                        <UIRenderer
+                            nodes={accessibleUI.nodes}
+                            onAction={handleUIAction}
+                            onInputChange={handleInputChange}
+                            onToggle={handleToggle}
+                            onSelectChange={handleSelectChange}
+                        />
+                    </div>
+                </article>
+            {:else}
+                <Alert.Root>
+                    <Alert.Title>No content</Alert.Title>
+                    <Alert.Description>Could not create an accessible version of this page. Try refreshing.</Alert.Description>
+                </Alert.Root>
+            {/if}
+        </div>
+    </ScrollArea>
 </main>
+{/if}
