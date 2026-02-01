@@ -106,6 +106,46 @@ function attachAllInputListeners() {
 }
 
 /**
+ * Get neighbor element IDs for an element (for semantic grouping placement).
+ * Finds tracked siblings and nearby elements that can help determine group placement.
+ */
+function getNeighborElementIds(element: HTMLElement): string[] {
+  if (!tracker) return [];
+
+  const neighborIds: string[] = [];
+
+  // Check previous siblings
+  let prev = element.previousElementSibling;
+  while (prev && neighborIds.length < 3) {
+    const id = tracker.getElementId(prev as HTMLElement);
+    if (id) neighborIds.push(id);
+    prev = prev.previousElementSibling;
+  }
+
+  // Check next siblings
+  let next = element.nextElementSibling;
+  while (next && neighborIds.length < 6) {
+    const id = tracker.getElementId(next as HTMLElement);
+    if (id) neighborIds.push(id);
+    next = next.nextElementSibling;
+  }
+
+  // Check parent's other children if we don't have enough neighbors
+  if (neighborIds.length < 3 && element.parentElement) {
+    for (const sibling of element.parentElement.children) {
+      if (sibling !== element && neighborIds.length < 6) {
+        const id = tracker.getElementId(sibling as HTMLElement);
+        if (id && !neighborIds.includes(id)) {
+          neighborIds.push(id);
+        }
+      }
+    }
+  }
+
+  return neighborIds;
+}
+
+/**
  * Get nearby text context for an element (for LLM evaluation)
  */
 function getNearbyTextContext(element: HTMLElement): string {
@@ -205,8 +245,8 @@ async function initTreeTracker() {
 
   // Initialize TreeTracker
   tracker = new TreeTracker({
-    confidenceThreshold: 0.6,
-    gracePeriodMs: 150, // Slightly longer than ElementTracker's 100ms for React
+    confidenceThreshold: 0.4, // Lower threshold for better matching
+    gracePeriodMs: 300, // Longer grace period for React re-renders
     debugMode: false,
   });
 
@@ -228,32 +268,23 @@ async function initTreeTracker() {
   // Forward node-added event
   tracker.on('node-added', (event) => {
     const detail = (event as CustomEvent).detail;
+    const element = tracker?.getElement(detail.node.id);
+
+    // Get neighbor IDs for semantic grouping placement
+    const neighborIds = element ? getNeighborElementIds(element) : [];
+
+    // Send node-added message with neighbor info for semantic grouping
     sendMessage({
       type: 'NODE_ADDED',
       parentId: detail.parentId,
       node: detail.node,
       index: detail.index,
+      neighborIds,
     });
 
     // Attach input listeners for interactive elements
-    if (detail.node.nodeType === 'interactive') {
-      const element = tracker?.getElement(detail.node.id);
-      if (element) {
-        attachInputListeners(element, detail.node.id);
-      }
-    }
-
-    // Notify for LLM evaluation (interactive elements only)
-    if (detail.node.nodeType === 'interactive') {
-      const element = tracker?.getElement(detail.node.id);
-      if (element) {
-        const nearbyText = getNearbyTextContext(element);
-        sendMessage({
-          type: 'ELEMENT_FOUND',
-          fingerprint: detail.node.fingerprint,
-          nearbyText,
-        });
-      }
+    if (detail.node.nodeType === 'interactive' && element) {
+      attachInputListeners(element, detail.node.id);
     }
   });
 
@@ -297,6 +328,24 @@ async function initTreeTracker() {
     }
   });
 
+  // Forward modal-opened event
+  tracker.on('modal-opened', (event) => {
+    const detail = (event as CustomEvent).detail;
+    sendMessage({
+      type: 'MODAL_OPENED',
+      modalId: detail.modalId,
+    });
+  });
+
+  // Forward modal-closed event
+  tracker.on('modal-closed', (event) => {
+    const detail = (event as CustomEvent).detail;
+    sendMessage({
+      type: 'MODAL_CLOSED',
+      modalId: detail.modalId,
+    });
+  });
+
   // Handle errors
   tracker.on('tree-error', (event) => {
     const detail = (event as CustomEvent).detail;
@@ -305,8 +354,6 @@ async function initTreeTracker() {
 
   // Start tracking (this will emit tree-initialized)
   await tracker.start();
-
-  console.debug('[Klaro] TreeTracker initialized');
 }
 
 // ============================================================================
@@ -328,7 +375,7 @@ export default defineContentScript({
     if (document.readyState === 'complete') initTooltips();
     else window.addEventListener('load', initTooltips);
 
-    // Handle messages from sidepanel
+    // Handle messages from sidepanel using async wrapper pattern
     browser.runtime.onMessage.addListener(
       (
         message: {
@@ -341,219 +388,297 @@ export default defineContentScript({
         _sender: unknown,
         sendResponse: (r: unknown) => void
       ) => {
-        // ===== PAGE SCANNING =====
-
-        // Legacy scan (with data-acc-id) - kept for backwards compatibility
-        if (message.type === 'SCAN_PAGE') {
-          try {
-            const result = scanPage();
-            sendResponse(result);
-          } catch (e) {
-            sendResponse({
-              article: null,
-              headings: [],
-              actions: [],
-              pageCopy: [],
-              error: e instanceof Error ? e.message : 'Scan failed',
-            });
-          }
-          return;
-        }
-
-        // Fingerprint-based scan (stable IDs that survive DOM destruction)
-        if (message.type === 'SCAN_PAGE_TRACKED') {
-          try {
-            // Get page content (article, headings, pageCopy) from dom-scanner
-            const content = scanPageContent();
-
-            // Get tracked actions from TreeTracker
-            const actions = tracker ? treeNodesToActions(tracker.getAllNodes()) : [];
-
-            // Send initial states for form elements
-            setTimeout(() => sendInitialStates(), 100);
-
-            sendResponse({
-              ...content,
-              actions,
-            });
-          } catch (e) {
-            sendResponse({
-              article: null,
-              headings: [],
-              actions: [],
-              pageCopy: [],
-              error: e instanceof Error ? e.message : 'Scan failed',
-            });
-          }
-          return;
-        }
-
-        // Hierarchical tree scan (full DOM tree mirroring)
-        if (message.type === 'SCAN_TREE') {
-          try {
-            // If tracker already has a tree, return it
-            // Otherwise, restart tracking to get a fresh tree
-            if (tracker) {
-              const tree = tracker.getTree();
-              if (tree) {
-                // Send initial states for form elements
-                setTimeout(() => sendInitialStates(), 100);
-
-                sendResponse({
-                  type: 'TREE_SCANNED',
-                  tree,
-                });
-                return;
-              }
-
-              // Restart tracking to get fresh tree
-              tracker.stop();
-              tracker.start().then((newTree) => {
-                sendResponse({
-                  type: 'TREE_SCANNED',
-                  tree: newTree,
-                });
-              });
-            } else {
-              sendResponse({
-                type: 'TREE_SCANNED',
-                tree: null,
-                error: 'Tracker not initialized',
-              });
-            }
-          } catch (e) {
-            console.error('[Klaro] SCAN_TREE error:', e);
-            sendResponse({
-              type: 'TREE_SCANNED',
-              tree: null,
-              error: e instanceof Error ? e.message : 'Scan failed',
-            });
-          }
-          return true; // Indicate async response
-        }
-
-        // Scroll to element and highlight it
-        if (message.type === 'SCROLL_TO_ELEMENT' && message.id) {
-          if (tracker) {
-            tracker.scrollToElement(message.id).then((result) => {
-              sendResponse({
-                type: 'SCROLL_COMPLETE',
-                success: result.success,
-                error: result.error,
-              });
-            });
-          } else {
-            sendResponse({
-              type: 'SCROLL_COMPLETE',
-              success: false,
-              error: 'Tracker not initialized',
-            });
-          }
-          return true; // Indicate async response
-        }
-
-        // ===== ELEMENT INTERACTIONS =====
-
-        if (message.type === 'CLICK_ELEMENT' && message.id) {
-          if (tracker) {
-            tracker.clickElement(message.id).then((result) => {
-              if (result.success) {
-                const element = tracker?.getElement(message.id!);
-                if (element) highlightElement(element);
-              }
-              sendResponse({ ok: result.success, error: result.error });
-            });
-          } else {
-            sendResponse({ ok: false, error: 'Tracker not initialized' });
-          }
-          return true; // Indicate async response
-        }
-
-        if (message.type === 'SET_INPUT_VALUE' && message.id && message.value !== undefined) {
-          if (tracker) {
-            tracker.setInputValue(message.id, message.value).then((result) => {
-              if (result.success) {
-                const element = tracker?.getElement(message.id!);
-                if (element) highlightElement(element);
-              }
-              sendResponse({ ok: result.success, error: result.error });
-            });
-          } else {
-            sendResponse({ ok: false, error: 'Tracker not initialized' });
-          }
-          return true; // Indicate async response
-        }
-
-        if (message.type === 'TOGGLE_CHECKBOX' && message.id) {
-          if (tracker) {
-            tracker.toggleCheckbox(message.id, message.checked).then((result) => {
-              if (result.success) {
-                const element = tracker?.getElement(message.id!);
-                if (element) highlightElement(element);
-              }
-              sendResponse({ ok: result.success, error: result.error });
-            });
-          } else {
-            sendResponse({ ok: false, error: 'Tracker not initialized' });
-          }
-          return true; // Indicate async response
-        }
-
-        if (message.type === 'SET_SELECT_VALUE' && message.id && message.value !== undefined) {
-          if (tracker) {
-            tracker.setSelectValue(message.id, message.value).then((result) => {
-              if (result.success) {
-                const element = tracker?.getElement(message.id!);
-                if (element) highlightElement(element);
-              }
-              sendResponse({ ok: result.success, error: result.error });
-            });
-          } else {
-            sendResponse({ ok: false, error: 'Tracker not initialized' });
-          }
-          return true; // Indicate async response
-        }
-
-        // ===== TOOLTIP MANAGEMENT =====
-
-        if (message.type === 'REMOVE_TOOLTIPS') {
-          removeMarks();
-          sendResponse({ ok: true });
-          return;
-        }
-
-        // ===== DEBUG MODE =====
-
-        if (message.type === 'SET_DEBUG_MODE' && tracker) {
-          tracker.setConfig({ debugMode: message.enabled ?? false });
-          sendResponse({ ok: true });
-          return;
-        }
-
-        // ===== TRACKER STATUS =====
-
-        if (message.type === 'GET_TRACKER_STATUS') {
-          if (tracker) {
-            const nodes = tracker.getAllNodes();
-            sendResponse({
-              ok: true,
-              trackerActive: true,
-              elementCount: nodes.length,
-              elements: treeNodesToActions(nodes),
-            });
-          } else {
-            sendResponse({
-              ok: true,
-              trackerActive: false,
-              elementCount: 0,
-              elements: [],
-            });
-          }
-          return;
-        }
-
-        sendResponse(undefined);
+        // Use async wrapper for clean async/await handling
+        handleMessage(message, sendResponse);
+        // Always return true to indicate async response will be sent
+        return true;
       }
     );
   },
 });
+
+// ============================================================================
+// MESSAGE HANDLERS
+// ============================================================================
+
+interface ContentMessage {
+  type: string;
+  id?: string;
+  value?: string;
+  checked?: boolean;
+  enabled?: boolean;
+}
+
+/**
+ * Main message handler with proper async/await pattern.
+ * All responses are sent via sendResponse callback.
+ */
+async function handleMessage(
+  message: ContentMessage,
+  sendResponse: (r: unknown) => void
+): Promise<void> {
+  try {
+    switch (message.type) {
+      // ===== PAGE SCANNING =====
+
+      case 'SCAN_PAGE':
+        handleScanPage(sendResponse);
+        break;
+
+      case 'SCAN_PAGE_TRACKED':
+        handleScanPageTracked(sendResponse);
+        break;
+
+      case 'SCAN_TREE':
+        await handleScanTree(sendResponse);
+        break;
+
+      case 'SCROLL_TO_ELEMENT':
+        await handleScrollToElement(message.id, sendResponse);
+        break;
+
+      // ===== ELEMENT INTERACTIONS =====
+
+      case 'CLICK_ELEMENT':
+        await handleClickElement(message.id, sendResponse);
+        break;
+
+      case 'SET_INPUT_VALUE':
+        await handleSetInputValue(message.id, message.value, sendResponse);
+        break;
+
+      case 'TOGGLE_CHECKBOX':
+        await handleToggleCheckbox(message.id, message.checked, sendResponse);
+        break;
+
+      case 'SET_SELECT_VALUE':
+        await handleSetSelectValue(message.id, message.value, sendResponse);
+        break;
+
+      // ===== TOOLTIP MANAGEMENT =====
+
+      case 'REMOVE_TOOLTIPS':
+        handleRemoveTooltips(sendResponse);
+        break;
+
+      // ===== DEBUG MODE =====
+
+      case 'SET_DEBUG_MODE':
+        handleSetDebugMode(message.enabled, sendResponse);
+        break;
+
+      // ===== TRACKER STATUS =====
+
+      case 'GET_TRACKER_STATUS':
+        handleGetTrackerStatus(sendResponse);
+        break;
+
+      default:
+        sendResponse(undefined);
+    }
+  } catch (e) {
+    console.error('[Klaro] Message handler error:', e);
+    sendResponse({ error: e instanceof Error ? e.message : 'Unknown error' });
+  }
+}
+
+function handleScanPage(sendResponse: (r: unknown) => void): void {
+  try {
+    const result = scanPage();
+    sendResponse(result);
+  } catch (e) {
+    sendResponse({
+      article: null,
+      headings: [],
+      actions: [],
+      pageCopy: [],
+      error: e instanceof Error ? e.message : 'Scan failed',
+    });
+  }
+}
+
+function handleScanPageTracked(sendResponse: (r: unknown) => void): void {
+  try {
+    const content = scanPageContent();
+    const actions = tracker ? treeNodesToActions(tracker.getAllNodes()) : [];
+    setTimeout(() => sendInitialStates(), 100);
+    sendResponse({ ...content, actions });
+  } catch (e) {
+    sendResponse({
+      article: null,
+      headings: [],
+      actions: [],
+      pageCopy: [],
+      error: e instanceof Error ? e.message : 'Scan failed',
+    });
+  }
+}
+
+async function handleScanTree(sendResponse: (r: unknown) => void): Promise<void> {
+  if (!tracker) {
+    sendResponse({ type: 'TREE_SCANNED', tree: null, error: 'Tracker not initialized' });
+    return;
+  }
+
+  try {
+    let tree = tracker.getTree();
+
+    if (!tree) {
+      // Restart tracking to get fresh tree
+      tracker.stop();
+      tree = await tracker.start();
+    }
+
+    setTimeout(() => sendInitialStates(), 100);
+    sendResponse({ type: 'TREE_SCANNED', tree });
+  } catch (e) {
+    sendResponse({
+      type: 'TREE_SCANNED',
+      tree: null,
+      error: e instanceof Error ? e.message : 'Scan failed',
+    });
+  }
+}
+
+async function handleScrollToElement(
+  id: string | undefined,
+  sendResponse: (r: unknown) => void
+): Promise<void> {
+  if (!id) {
+    sendResponse({ type: 'SCROLL_COMPLETE', success: false, error: 'No element ID provided' });
+    return;
+  }
+
+  if (!tracker) {
+    sendResponse({ type: 'SCROLL_COMPLETE', success: false, error: 'Tracker not initialized' });
+    return;
+  }
+
+  const result = await tracker.scrollToElement(id);
+  sendResponse({ type: 'SCROLL_COMPLETE', success: result.success, error: result.error });
+}
+
+async function handleClickElement(
+  id: string | undefined,
+  sendResponse: (r: unknown) => void
+): Promise<void> {
+  if (!id) {
+    sendResponse({ ok: false, error: 'No element ID provided' });
+    return;
+  }
+
+  if (!tracker) {
+    sendResponse({ ok: false, error: 'Tracker not initialized' });
+    return;
+  }
+
+  const result = await tracker.clickElement(id);
+  if (result.success) {
+    const element = tracker.getElement(id);
+    if (element) highlightElement(element);
+  }
+  sendResponse({ ok: result.success, error: result.error });
+}
+
+async function handleSetInputValue(
+  id: string | undefined,
+  value: string | undefined,
+  sendResponse: (r: unknown) => void
+): Promise<void> {
+  if (!id || value === undefined) {
+    sendResponse({ ok: false, error: 'Missing element ID or value' });
+    return;
+  }
+
+  if (!tracker) {
+    sendResponse({ ok: false, error: 'Tracker not initialized' });
+    return;
+  }
+
+  const result = await tracker.setInputValue(id, value);
+  if (result.success) {
+    const element = tracker.getElement(id);
+    if (element) highlightElement(element);
+  }
+  sendResponse({ ok: result.success, error: result.error });
+}
+
+async function handleToggleCheckbox(
+  id: string | undefined,
+  checked: boolean | undefined,
+  sendResponse: (r: unknown) => void
+): Promise<void> {
+  if (!id) {
+    sendResponse({ ok: false, error: 'No element ID provided' });
+    return;
+  }
+
+  if (!tracker) {
+    sendResponse({ ok: false, error: 'Tracker not initialized' });
+    return;
+  }
+
+  const result = await tracker.toggleCheckbox(id, checked);
+  if (result.success) {
+    const element = tracker.getElement(id);
+    if (element) highlightElement(element);
+  }
+  sendResponse({ ok: result.success, error: result.error });
+}
+
+async function handleSetSelectValue(
+  id: string | undefined,
+  value: string | undefined,
+  sendResponse: (r: unknown) => void
+): Promise<void> {
+  if (!id || value === undefined) {
+    sendResponse({ ok: false, error: 'Missing element ID or value' });
+    return;
+  }
+
+  if (!tracker) {
+    sendResponse({ ok: false, error: 'Tracker not initialized' });
+    return;
+  }
+
+  const result = await tracker.setSelectValue(id, value);
+  if (result.success) {
+    const element = tracker.getElement(id);
+    if (element) highlightElement(element);
+  }
+  sendResponse({ ok: result.success, error: result.error });
+}
+
+function handleRemoveTooltips(sendResponse: (r: unknown) => void): void {
+  removeMarks();
+  sendResponse({ ok: true });
+}
+
+function handleSetDebugMode(
+  enabled: boolean | undefined,
+  sendResponse: (r: unknown) => void
+): void {
+  if (tracker) {
+    tracker.setConfig({ debugMode: enabled ?? false });
+  }
+  sendResponse({ ok: true });
+}
+
+function handleGetTrackerStatus(sendResponse: (r: unknown) => void): void {
+  if (tracker) {
+    const nodes = tracker.getAllNodes();
+    sendResponse({
+      ok: true,
+      trackerActive: true,
+      elementCount: nodes.length,
+      elements: treeNodesToActions(nodes),
+    });
+  } else {
+    sendResponse({
+      ok: true,
+      trackerActive: false,
+      elementCount: 0,
+      elements: [],
+    });
+  }
+}

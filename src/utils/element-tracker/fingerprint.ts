@@ -131,7 +131,7 @@ function getElementValue(element: HTMLElement): string | null {
  * Normalize href to remove query params and fragments for matching.
  * Keeps the path for identification purposes.
  */
-function normalizeHref(href: string | null): string | null {
+export function normalizeHref(href: string | null): string | null {
   if (!href) return null;
   try {
     // Handle relative URLs
@@ -812,4 +812,186 @@ export function isInteractiveElement(element: HTMLElement): boolean {
   }
 
   return false;
+}
+
+// =============================================================================
+// Fingerprint-to-Fingerprint Comparison
+// =============================================================================
+
+/**
+ * Calculate similarity between two fingerprints WITHOUT needing DOM elements.
+ * Useful for sidebar deduplication when matching new elements against existing ones.
+ *
+ * Returns a confidence score from 0 to 1.
+ * Uses same weights as production matcher but compares fingerprint data directly.
+ *
+ * @param fp1 First fingerprint
+ * @param fp2 Second fingerprint
+ * @param threshold Minimum similarity to consider a match (default: 0.5, lower than element matcher)
+ * @returns Similarity score (0-1), or 0 if basic criteria don't match
+ */
+export function calculateFingerprintSimilarity(
+  fp1: ElementFingerprint,
+  fp2: ElementFingerprint,
+  threshold = 0.5
+): number {
+  // PREREQUISITE: Tag must match exactly
+  if (fp1.tagName !== fp2.tagName) {
+    return 0;
+  }
+
+  // TestId exact match = perfect similarity
+  if (fp1.testId && fp2.testId) {
+    return fp1.testId === fp2.testId ? 1.0 : 0;
+  }
+
+  // Calculate component scores
+  let totalWeight = 0;
+  let weightedScore = 0;
+
+  // 1. Identity score (htmlId)
+  if (fp1.htmlId || fp2.htmlId) {
+    const weight = 0.9;
+    totalWeight += weight;
+    if (fp1.htmlId && fp2.htmlId && fp1.htmlId === fp2.htmlId) {
+      weightedScore += weight;
+    }
+  }
+
+  // 2. Structural score (ancestorPath, siblingIndex)
+  const structureWeight = 0.85;
+  totalWeight += structureWeight;
+  const ancestorSim = fpAncestorPathSimilarity(fp1.ancestorPath, fp2.ancestorPath);
+  const siblingBonus =
+    fp1.siblingIndex === fp2.siblingIndex
+      ? 0.3
+      : Math.abs(fp1.siblingIndex - fp2.siblingIndex) <= 2
+        ? 0.15
+        : 0;
+  weightedScore += structureWeight * (ancestorSim * 0.7 + siblingBonus);
+
+  // 3. Landmark score (nearestLandmark) - CRITICAL for semantic matching
+  const landmarkWeight = 0.8;
+  totalWeight += landmarkWeight;
+  if (fp1.nearestLandmark && fp2.nearestLandmark) {
+    const landmarkMatch =
+      fp1.nearestLandmark.tagName === fp2.nearestLandmark.tagName &&
+      fp1.nearestLandmark.role === fp2.nearestLandmark.role;
+    if (landmarkMatch) {
+      weightedScore += landmarkWeight;
+    }
+  } else if (!fp1.nearestLandmark && !fp2.nearestLandmark) {
+    // Both have no landmark - neutral
+    weightedScore += landmarkWeight * 0.5;
+  }
+
+  // 4. Semantic score (role, name)
+  if (fp1.role || fp2.role) {
+    const weight = 0.7;
+    totalWeight += weight;
+    if (fp1.role && fp2.role && fp1.role === fp2.role) {
+      weightedScore += weight;
+    }
+  }
+
+  if (fp1.name || fp2.name) {
+    const weight = 0.7;
+    totalWeight += weight;
+    if (fp1.name && fp2.name && fp1.name === fp2.name) {
+      weightedScore += weight;
+    }
+  }
+
+  // 5. Input type (for form elements)
+  if (fp1.inputType || fp2.inputType) {
+    const weight = 0.8;
+    totalWeight += weight;
+    if (fp1.inputType && fp2.inputType && fp1.inputType === fp2.inputType) {
+      weightedScore += weight;
+    }
+  }
+
+  // 6. Position score (bounding box similarity)
+  const positionWeight = 0.6;
+  totalWeight += positionWeight;
+  const positionSim = fpBoundingBoxSimilarity(fp1.boundingBox, fp2.boundingBox);
+  weightedScore += positionWeight * positionSim;
+
+  // 7. Content score (lower weight - text changes frequently)
+  // Only use for differentiation, not as primary signal
+  if (
+    fp1.textContent &&
+    fp2.textContent &&
+    fp1.textContent.length > 5 &&
+    fp2.textContent.length > 5
+  ) {
+    const weight = 0.2;
+    totalWeight += weight;
+    // Simple overlap check
+    const sim = fpTextOverlapSimilarity(fp1.textContent, fp2.textContent);
+    weightedScore += weight * sim;
+  }
+
+  const finalScore = totalWeight > 0 ? weightedScore / totalWeight : 0;
+  return finalScore >= threshold ? finalScore : 0;
+}
+
+/**
+ * Calculate ancestor path similarity between two fingerprints.
+ */
+function fpAncestorPathSimilarity(path1: AncestorInfo[], path2: AncestorInfo[]): number {
+  if (path1.length === 0 && path2.length === 0) return 1;
+  if (path1.length === 0 || path2.length === 0) return 0;
+
+  const minLen = Math.min(path1.length, path2.length);
+  let matches = 0;
+
+  for (let i = 0; i < minLen; i++) {
+    if (path1[i].tagName === path2[i].tagName) {
+      matches += 0.6;
+      if (path1[i].landmark && path1[i].landmark === path2[i].landmark) {
+        matches += 0.4;
+      }
+    }
+  }
+
+  return matches / minLen;
+}
+
+/**
+ * Calculate bounding box similarity (IoU-like metric).
+ */
+function fpBoundingBoxSimilarity(box1: BoundingBox, box2: BoundingBox): number {
+  // Check for similar position (within 100px)
+  const xDiff = Math.abs(box1.x - box2.x);
+  const yDiff = Math.abs(box1.y - box2.y);
+
+  if (xDiff > 200 || yDiff > 200) return 0;
+
+  const positionScore = 1 - (xDiff + yDiff) / 400;
+
+  // Check for similar size
+  const widthRatio = Math.min(box1.width, box2.width) / Math.max(box1.width, box2.width || 1);
+  const heightRatio = Math.min(box1.height, box2.height) / Math.max(box1.height, box2.height || 1);
+  const sizeScore = (widthRatio + heightRatio) / 2;
+
+  return positionScore * 0.7 + sizeScore * 0.3;
+}
+
+/**
+ * Simple text overlap similarity.
+ */
+function fpTextOverlapSimilarity(text1: string, text2: string): number {
+  if (text1 === text2) return 1;
+
+  const words1 = new Set(text1.toLowerCase().split(/\s+/));
+  const words2 = new Set(text2.toLowerCase().split(/\s+/));
+
+  let overlap = 0;
+  for (const word of words1) {
+    if (words2.has(word)) overlap++;
+  }
+
+  const union = new Set([...words1, ...words2]).size;
+  return union > 0 ? overlap / union : 0;
 }

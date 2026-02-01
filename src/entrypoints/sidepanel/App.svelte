@@ -1,10 +1,19 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import type { ActionBinding } from '$lib/schemas/accessible-ui';
-  import type { ScanTreeResponse, DOMTreeNode, DOMTreeNodeBase } from '$lib/schemas/dom-tree';
-  import type { ElementFingerprint } from '../../utils/element-tracker/types';
-  import { domTreeStore } from './stores/dom-tree.svelte';
-  import TreeView from './components/TreeView.svelte';
+  import type {
+    ScanTreeResponse,
+    DOMTreeNode,
+    DOMTreeNodeBase,
+    DOMTree,
+  } from '$lib/schemas/dom-tree';
+  import { CONFIG } from '../../config';
+  import type { TrackedElementData, DisplayGroup } from '$lib/schemas/semantic-groups';
+  import { createFlatListFallback, generateGroupId } from '$lib/schemas/semantic-groups';
+  import type { ElementFingerprint, NodeType } from '../../utils/element-tracker/types';
+  import { semanticTreeStore } from './stores/semantic-tree.svelte';
+  import { generateSemanticGroups } from '../../utils/llm-service';
+  import GroupView from './components/GroupView.svelte';
 
   // shadcn components
   import * as Alert from '$lib/components/ui/alert';
@@ -14,13 +23,14 @@
   import { Separator } from '$lib/components/ui/separator';
 
   // =============================================================================
-  // Constants
+  // Constants (from centralized config)
   // =============================================================================
 
-  const COOLDOWN_MS = 10_000;
-  const INPUT_DEBOUNCE_MS = 300;
-  const COOLDOWN_UPDATE_INTERVAL_MS = 100;
-  const URL_CHANGE_DEBOUNCE_MS = 500;
+  const COOLDOWN_MS = CONFIG.ui.cooldownMs;
+  const INPUT_DEBOUNCE_MS = CONFIG.ui.inputDebounceMs;
+  const COOLDOWN_UPDATE_INTERVAL_MS = CONFIG.ui.cooldownUpdateIntervalMs;
+  const URL_CHANGE_DEBOUNCE_MS = CONFIG.ui.urlChangeDebounceMs;
+  const EDITING_LOCKOUT_MS = CONFIG.ui.editingLockoutMs;
 
   // =============================================================================
   // State
@@ -37,10 +47,6 @@
 
   // Track elements being actively edited
   const activelyEditing = new Map<string, number>();
-  const EDITING_LOCKOUT_MS = 2000;
-
-  // Element states from content script
-  let elementStates = $state<Map<string, Record<string, unknown>>>(new Map());
 
   // Derived state
   const isOnCooldown = $derived(cooldownRemaining > 0);
@@ -77,6 +83,7 @@
     parentId: string;
     node: DOMTreeNode;
     index: number;
+    neighborIds?: string[];
   }
 
   interface NodeRemovedMessage {
@@ -97,6 +104,22 @@
     changes: Partial<DOMTreeNodeBase>;
   }
 
+  interface TreeScannedMessage {
+    type: 'TREE_SCANNED';
+    tree: DOMTree | null;
+    error?: string;
+  }
+
+  interface ModalOpenedMessage {
+    type: 'MODAL_OPENED';
+    modalId: string | null;
+  }
+
+  interface ModalClosedMessage {
+    type: 'MODAL_CLOSED';
+    modalId: string | null;
+  }
+
   type ContentMessage =
     | StatePatchMessage
     | ElementRemovedMessage
@@ -105,7 +128,10 @@
     | NodeAddedMessage
     | NodeRemovedMessage
     | NodeUpdatedMessage
-    | NodeMatchedMessage;
+    | NodeMatchedMessage
+    | TreeScannedMessage
+    | ModalOpenedMessage
+    | ModalClosedMessage;
 
   // =============================================================================
   // Helpers
@@ -162,50 +188,124 @@
     return true;
   }
 
+  /**
+   * Convert DOMTreeNode to TrackedElementData
+   */
+  function nodeToElementData(node: DOMTreeNode): TrackedElementData {
+    return {
+      id: node.id,
+      fingerprint: node.fingerprint,
+      tagName: node.tagName,
+      nodeType: node.nodeType,
+      label: node.label,
+      originalLabel: node.originalLabel,
+      description: node.description,
+      interactiveType: node.interactiveType,
+      placeholder: node.placeholder,
+      headingLevel: node.headingLevel,
+      altText: node.altText,
+    };
+  }
+
+  /**
+   * Flatten DOM tree to element map
+   */
+  function treeToElementMap(root: DOMTreeNode): Map<string, TrackedElementData> {
+    const elements = new Map<string, TrackedElementData>();
+
+    function traverse(node: DOMTreeNode): void {
+      // Only include meaningful elements (interactive, text, media)
+      if (
+        node.nodeType === 'interactive' ||
+        node.nodeType === 'text' ||
+        node.nodeType === 'media'
+      ) {
+        elements.set(node.id, nodeToElementData(node));
+      }
+      for (const child of node.children) {
+        traverse(child);
+      }
+    }
+
+    traverse(root);
+    return elements;
+  }
+
   // =============================================================================
-  // Scanning
+  // Scanning with Semantic Grouping
   // =============================================================================
 
   async function performScan(tabId: number): Promise<void> {
+    // Get DOM tree from content script
     const response = (await browser.tabs.sendMessage(tabId, {
       type: 'SCAN_TREE',
     })) as ScanTreeResponse;
 
     if (response.error || !response.tree) {
-      domTreeStore.setError(response.error || 'Scan failed');
+      semanticTreeStore.setError(response.error || 'Scan failed');
       return;
     }
 
-    // Initialize store with scanned tree
-    domTreeStore.initializeTree(response.tree);
+    const { tree } = response;
+
+    // Convert DOM tree nodes to element map
+    const elements = treeToElementMap(tree.root);
+
+    // Try to generate semantic groups via LLM
+    let groups: DisplayGroup[] | null = null;
+
+    try {
+      groups = await generateSemanticGroups(elements, tree.title, tree.url);
+    } catch (error) {
+      console.warn('[Klaro] LLM grouping failed, using flat list:', error);
+    }
+
+    // Fall back to flat list if LLM fails
+    if (!groups) {
+      semanticTreeStore.initializeFlat(tree.url, tree.title, elements);
+      return;
+    }
+
+    // Initialize semantic tree with LLM-generated groups
+    semanticTreeStore.initializeTree(
+      {
+        groups,
+        url: tree.url,
+        title: tree.title,
+        modalActive: false,
+        modalGroup: null,
+        version: 1,
+      },
+      elements
+    );
   }
 
   async function scanCurrentTab(): Promise<void> {
     if (isOnCooldown) return;
 
-    domTreeStore.setLoading(true);
-    domTreeStore.setError(null);
+    semanticTreeStore.setLoading(true);
+    semanticTreeStore.setError(null);
     startCooldown();
 
     try {
       const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
 
       if (!tab?.id) {
-        domTreeStore.setError('No active tab found.');
+        semanticTreeStore.setError('No active tab found.');
         return;
       }
 
       await performScan(tab.id);
     } catch (e) {
-      domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-      domTreeStore.reset();
+      semanticTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+      semanticTreeStore.reset();
     } finally {
-      domTreeStore.setLoading(false);
+      semanticTreeStore.setLoading(false);
     }
   }
 
   async function handleUrlChange(newUrl: string): Promise<void> {
-    if (newUrl === domTreeStore.url) return;
+    if (newUrl === semanticTreeStore.url) return;
 
     if (urlChangeDebounceTimer) {
       clearTimeout(urlChangeDebounceTimer);
@@ -214,24 +314,24 @@
     urlChangeDebounceTimer = setTimeout(async () => {
       urlChangeDebounceTimer = null;
 
-      domTreeStore.setLoading(true);
-      domTreeStore.setError(null);
+      semanticTreeStore.setLoading(true);
+      semanticTreeStore.setError(null);
 
       try {
         const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
 
         if (!tab?.id) {
-          domTreeStore.setError('No active tab found.');
+          semanticTreeStore.setError('No active tab found.');
           return;
         }
 
-        domTreeStore.reset();
+        semanticTreeStore.reset();
         await performScan(tab.id);
       } catch (e) {
-        domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-        domTreeStore.reset();
+        semanticTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+        semanticTreeStore.reset();
       } finally {
-        domTreeStore.setLoading(false);
+        semanticTreeStore.setLoading(false);
       }
     }, URL_CHANGE_DEBOUNCE_MS);
   }
@@ -252,7 +352,11 @@
         handleInitialState(message);
         break;
       case 'ELEMENT_MATCHED':
-        handleElementMatched(message);
+        // Element matched after re-render - no action needed for semantic groups
+        // Element stays in its group regardless of DOM position
+        break;
+      case 'TREE_SCANNED':
+        handleTreeScanned(message);
         break;
       case 'NODE_ADDED':
         handleNodeAdded(message);
@@ -264,7 +368,14 @@
         handleNodeUpdated(message);
         break;
       case 'NODE_MATCHED':
+        // Node matched after re-render - element stays in place
         handleNodeMatched(message);
+        break;
+      case 'MODAL_OPENED':
+        handleModalOpened(message);
+        break;
+      case 'MODAL_CLOSED':
+        handleModalClosed();
         break;
     }
   }
@@ -281,53 +392,113 @@
       message = { ...message, changes: filteredChanges };
     }
 
-    const current = elementStates.get(message.id) || {};
-    elementStates.set(message.id, { ...current, ...message.changes });
-    elementStates = new Map(elementStates);
-
-    domTreeStore.updateElementState(message.id, message.changes);
+    // Update form state in semantic tree store
+    semanticTreeStore.updateElementFormState(message.id, {
+      value: message.changes.value as string | undefined,
+      checked: message.changes.checked as boolean | undefined,
+      disabled: message.changes.disabled as boolean | undefined,
+      options: message.changes.options as
+        | Array<{ value: string; label: string; selected: boolean }>
+        | undefined,
+    });
   }
 
   function handleElementRemoved(message: ElementRemovedMessage): void {
-    elementStates.delete(message.id);
-    elementStates = new Map(elementStates);
-    domTreeStore.removeNode(message.id);
+    semanticTreeStore.removeElement(message.id);
   }
 
   function handleInitialState(message: InitialStateMessage): void {
     for (const [elementId, state] of Object.entries(message.states)) {
-      elementStates.set(elementId, state);
+      semanticTreeStore.updateElementFormState(elementId, {
+        value: state.value as string | undefined,
+        checked: state.checked as boolean | undefined,
+        disabled: state.disabled as boolean | undefined,
+        options: state.options as
+          | Array<{ value: string; label: string; selected: boolean }>
+          | undefined,
+      });
     }
-    elementStates = new Map(elementStates);
-    domTreeStore.setInitialElementStates(message.states);
-  }
-
-  function handleElementMatched(message: ElementMatchedMessage): void {
-    const { fingerprint } = message;
-    domTreeStore.updateNodeFingerprint(fingerprint.id, fingerprint);
   }
 
   // Tree sync handlers
   function handleNodeAdded(message: NodeAddedMessage): void {
-    const { parentId, node, index } = message;
-    domTreeStore.addNode(parentId, node, index);
+    const { node, neighborIds = [] } = message;
+
+    // Only add meaningful elements
+    if (node.nodeType !== 'interactive' && node.nodeType !== 'text' && node.nodeType !== 'media') {
+      return;
+    }
+
+    const elementData = nodeToElementData(node);
+    semanticTreeStore.addElement(elementData, neighborIds);
   }
 
   function handleNodeRemoved(message: NodeRemovedMessage): void {
     const { nodeId } = message;
-    domTreeStore.removeNode(nodeId);
-    elementStates.delete(nodeId);
-    elementStates = new Map(elementStates);
+    semanticTreeStore.removeElement(nodeId);
   }
 
   function handleNodeUpdated(message: NodeUpdatedMessage): void {
     const { nodeId, changes } = message;
-    domTreeStore.updateNode(nodeId, changes);
+    semanticTreeStore.updateElement(nodeId, changes as Partial<TrackedElementData>);
   }
 
   function handleNodeMatched(message: NodeMatchedMessage): void {
     const { nodeId, changes } = message;
-    domTreeStore.updateNode(nodeId, changes);
+    // Element stays in its semantic group - just update any changed properties
+    semanticTreeStore.updateElement(nodeId, changes as Partial<TrackedElementData>);
+  }
+
+  async function handleTreeScanned(message: TreeScannedMessage): Promise<void> {
+    if (message.error || !message.tree) {
+      // Tree scan failed or not ready - will retry via performScan
+      return;
+    }
+
+    // Tree received from content script - process it
+    const elements = treeToElementMap(message.tree.root);
+
+    // Try to generate semantic groups via LLM
+    let groups: DisplayGroup[] | null = null;
+
+    try {
+      groups = await generateSemanticGroups(elements, message.tree.title, message.tree.url);
+    } catch (error) {
+      console.warn('[Klaro] LLM grouping failed, using flat list:', error);
+    }
+
+    // Fall back to flat list if LLM fails
+    if (!groups) {
+      semanticTreeStore.initializeFlat(message.tree.url, message.tree.title, elements);
+    } else {
+      semanticTreeStore.initializeTree(
+        {
+          groups,
+          url: message.tree.url,
+          title: message.tree.title,
+          modalActive: false,
+          modalGroup: null,
+          version: 1,
+        },
+        elements
+      );
+    }
+
+    semanticTreeStore.setLoading(false);
+  }
+
+  function handleModalOpened(message: ModalOpenedMessage): void {
+    // Modal opened - switch to modal overlay mode
+    // For now, just log - full implementation would create modal group
+    console.info('[Klaro] Modal opened:', message.modalId);
+    // TODO: Collect modal elements and call semanticTreeStore.enterModalOverlay()
+  }
+
+  function handleModalClosed(): void {
+    // Modal closed - exit overlay mode
+    if (semanticTreeStore.modalActive) {
+      semanticTreeStore.exitModalOverlay();
+    }
   }
 
   // =============================================================================
@@ -366,8 +537,8 @@
     sendToActiveTab({ type: 'SCROLL_TO_ELEMENT', id: elementId });
   }
 
-  function handleToggleNode(nodeId: string): void {
-    domTreeStore.toggleNode(nodeId);
+  function handleToggleGroup(groupId: string): void {
+    semanticTreeStore.toggleGroup(groupId);
   }
 
   // =============================================================================
@@ -375,24 +546,35 @@
   // =============================================================================
 
   onMount(() => {
-    domTreeStore.setLoading(true);
-    domTreeStore.setError(null);
+    semanticTreeStore.setLoading(true);
+    semanticTreeStore.setError(null);
 
-    const messageListener = (message: any) => {
+    const messageListener = (message: unknown) => {
+      // Type guard for message validation
+      if (!message || typeof message !== 'object' || !('type' in message)) {
+        return;
+      }
+
+      const msg = message as { type: string; [key: string]: unknown };
+
       const handledTypes = [
         'STATE_PATCH',
         'ELEMENT_REMOVED',
         'INITIAL_STATE',
         'ELEMENT_MATCHED',
         // Tree sync messages
+        'TREE_SCANNED',
         'NODE_ADDED',
         'NODE_REMOVED',
         'NODE_UPDATED',
-        'NODE_MATCHED', // Re-render detection
+        'NODE_MATCHED',
+        // Modal messages
+        'MODAL_OPENED',
+        'MODAL_CLOSED',
       ];
 
-      if (message.type && handledTypes.includes(message.type)) {
-        handleContentMessage(message as ContentMessage);
+      if (handledTypes.includes(msg.type)) {
+        handleContentMessage(msg as ContentMessage);
       }
     };
 
@@ -414,18 +596,18 @@
 
     browser.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
       if (!tab?.id) {
-        domTreeStore.setError('No active tab found.');
-        domTreeStore.setLoading(false);
+        semanticTreeStore.setError('No active tab found.');
+        semanticTreeStore.setLoading(false);
         return;
       }
 
       try {
         await performScan(tab.id);
       } catch (e) {
-        domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-        domTreeStore.reset();
+        semanticTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+        semanticTreeStore.reset();
       } finally {
-        domTreeStore.setLoading(false);
+        semanticTreeStore.setLoading(false);
       }
     });
 
@@ -449,20 +631,20 @@
       <h1 class="font-bold text-xl">Klaro</h1>
     </div>
     <div class="flex items-center gap-2">
-      {#if domTreeStore.tree}
+      {#if semanticTreeStore.tree}
         <Button
           variant="ghost"
           size="sm"
-          onclick={() => domTreeStore.expandAll()}
-          title="Expand all nodes"
+          onclick={() => semanticTreeStore.expandAll()}
+          title="Expand all groups"
         >
           ↓↓
         </Button>
         <Button
           variant="ghost"
           size="sm"
-          onclick={() => domTreeStore.collapseAll()}
-          title="Collapse all nodes"
+          onclick={() => semanticTreeStore.collapseAll()}
+          title="Collapse all groups"
         >
           ↑↑
         </Button>
@@ -471,7 +653,7 @@
         variant="outline"
         size="sm"
         onclick={() => scanCurrentTab()}
-        disabled={isOnCooldown || domTreeStore.loading}
+        disabled={isOnCooldown || semanticTreeStore.loading}
       >
         {#if isOnCooldown}
           {Math.ceil(cooldownRemaining / 1000)}s
@@ -484,30 +666,30 @@
 
   <!-- CONTENT -->
   <ScrollArea class="flex-1">
-    {#if domTreeStore.loading}
+    {#if semanticTreeStore.loading}
       <!-- Loading State -->
       <div class="p-4 space-y-4">
         <Skeleton class="h-8 w-3/4" />
         <div class="space-y-2">
-          <Skeleton class="h-6 w-full rounded" />
+          <Skeleton class="h-10 w-full rounded-md" />
           <Skeleton class="h-6 w-11/12 rounded ml-4" />
-          <Skeleton class="h-6 w-10/12 rounded ml-8" />
-          <Skeleton class="h-6 w-full rounded" />
+          <Skeleton class="h-6 w-10/12 rounded ml-4" />
+          <Skeleton class="h-10 w-full rounded-md" />
           <Skeleton class="h-6 w-11/12 rounded ml-4" />
         </div>
         <Separator class="my-4" />
         <div class="space-y-2">
-          <Skeleton class="h-6 w-full rounded" />
+          <Skeleton class="h-10 w-full rounded-md" />
           <Skeleton class="h-6 w-10/12 rounded ml-4" />
         </div>
       </div>
-    {:else if domTreeStore.error}
+    {:else if semanticTreeStore.error}
       <!-- Error State -->
       <div class="p-4">
         <Alert.Root variant="destructive">
           <Alert.Title>Unable to scan page</Alert.Title>
           <Alert.Description>
-            {domTreeStore.error}
+            {semanticTreeStore.error}
             <br /><br />
             Try refreshing the page or open a normal webpage (not chrome:// or extension pages).
           </Alert.Description>
@@ -525,29 +707,29 @@
           {/if}
         </Button>
       </div>
-    {:else if domTreeStore.tree}
-      <!-- Tree View -->
-      <div class="tree-container">
-        {#if domTreeStore.title}
+    {:else if semanticTreeStore.tree}
+      <!-- Semantic Group View -->
+      <div class="groups-container">
+        {#if semanticTreeStore.title}
           <div class="p-4 pb-2">
-            <h2 class="text-lg font-semibold text-foreground">{domTreeStore.title}</h2>
+            <h2 class="text-lg font-semibold text-foreground">{semanticTreeStore.title}</h2>
             <p class="text-sm text-muted-foreground">
-              {domTreeStore.nodeCount} elements
+              {semanticTreeStore.elementCount} elements in {semanticTreeStore.groupCount} groups
             </p>
           </div>
           <Separator />
         {/if}
 
-        <TreeView
-          root={domTreeStore.tree.root}
-          modalFocusMode={domTreeStore.modalFocusMode}
-          onToggle={handleToggleNode}
+        <GroupView
+          tree={semanticTreeStore.tree}
+          elements={semanticTreeStore.elements}
+          modalActive={semanticTreeStore.modalActive}
+          onToggleGroup={handleToggleGroup}
           onAction={handleUIAction}
           onInputChange={handleInputChange}
           onToggleCheckbox={handleToggle}
           onSelectChange={handleSelectChange}
           onScrollTo={handleScrollTo}
-          {elementStates}
         />
       </div>
     {:else}

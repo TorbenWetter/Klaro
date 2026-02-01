@@ -212,6 +212,8 @@ export type TreeTrackerEventType =
   | 'node-removed'
   | 'node-updated'
   | 'node-matched'
+  | 'modal-opened'
+  | 'modal-closed'
   | 'tree-error';
 
 /**
@@ -260,6 +262,23 @@ export interface NodeMatchedEvent {
 }
 
 /**
+ * Emitted when a modal dialog is opened
+ */
+export interface ModalOpenedEvent {
+  type: 'modal-opened';
+  modalId: string | null;
+  element: HTMLElement;
+}
+
+/**
+ * Emitted when a modal dialog is closed
+ */
+export interface ModalClosedEvent {
+  type: 'modal-closed';
+  modalId: string | null;
+}
+
+/**
  * Emitted when an error occurs
  */
 export interface TreeErrorEvent {
@@ -276,6 +295,8 @@ export type TreeTrackerEvent =
   | NodeRemovedEvent
   | NodeUpdatedEvent
   | NodeMatchedEvent
+  | ModalOpenedEvent
+  | ModalClosedEvent
   | TreeErrorEvent;
 
 // =============================================================================

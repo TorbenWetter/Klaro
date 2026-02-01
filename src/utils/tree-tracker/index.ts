@@ -17,13 +17,14 @@ import type {
   TreeTrackerEventType,
   ActionResult,
 } from './types';
-import { DEFAULT_TREE_TRACKER_CONFIG } from './types';
+import { CONFIG } from '../../config';
 import type { ElementFingerprint } from '../element-tracker/types';
 import {
   createFingerprint,
   updateFingerprint,
   getVisibleText,
   normalizeText,
+  normalizeHref,
 } from '../element-tracker/fingerprint';
 import { findBestMatch, matchAll } from '../element-tracker/matcher';
 import {
@@ -45,6 +46,20 @@ import {
 // =============================================================================
 
 /**
+ * Build default config from centralized CONFIG
+ */
+function buildDefaultConfig(): TreeTrackerConfig {
+  return {
+    confidenceThreshold: CONFIG.tracking.confidenceThreshold,
+    gracePeriodMs: CONFIG.tracking.gracePeriodMs,
+    maxNodes: CONFIG.tracking.maxNodes,
+    maxDepth: CONFIG.tracking.maxDepth,
+    weights: CONFIG.tracking.weights,
+    debugMode: false,
+  };
+}
+
+/**
  * Main tree tracker class.
  * Tracks all visible DOM elements across mutations using fingerprinting.
  */
@@ -52,6 +67,7 @@ export class TreeTracker extends EventTarget {
   private config: TreeTrackerConfig;
   private tree: DOMTree | null;
   private nodeMap: Map<string, TrackedNode>;
+  private elementToId: WeakMap<HTMLElement, string>; // O(1) reverse lookup
   private observer: MutationObserver | null;
   private container: HTMLElement | Document;
 
@@ -67,9 +83,10 @@ export class TreeTracker extends EventTarget {
 
   constructor(config: Partial<TreeTrackerConfig> = {}) {
     super();
-    this.config = { ...DEFAULT_TREE_TRACKER_CONFIG, ...config };
+    this.config = { ...buildDefaultConfig(), ...config };
     this.tree = null;
     this.nodeMap = new Map();
+    this.elementToId = new WeakMap();
     this.observer = null;
     this.container = document;
 
@@ -93,15 +110,17 @@ export class TreeTracker extends EventTarget {
   async start(container: HTMLElement | Document = document): Promise<DOMTree> {
     this.container = container;
 
+    // Always log startup for debugging
+    console.log('[TreeTracker] Starting with debugMode:', this.config.debugMode);
+
     // Build initial tree
     this.tree = this.buildInitialTree();
 
     // Populate nodeMap with all nodes
     this.populateNodeMap(this.tree.root, null);
 
-    if (this.config.debugMode) {
-      console.log('[TreeTracker] Started with', this.nodeMap.size, 'nodes');
-    }
+    // Mark ALL visible elements in DOM to prevent re-adding them later
+    this.markAllVisibleElements(container instanceof Document ? container.body : container);
 
     // Set up mutation observer
     this.observer = new MutationObserver(this.handleMutations.bind(this));
@@ -168,10 +187,7 @@ export class TreeTracker extends EventTarget {
     // Clear state
     this.tree = null;
     this.nodeMap.clear();
-
-    if (this.config.debugMode) {
-      console.log('[TreeTracker] Stopped');
-    }
+    this.elementToId = new WeakMap();
   }
 
   // ===========================================================================
@@ -221,6 +237,15 @@ export class TreeTracker extends EventTarget {
   getAllNodes(): TreeNode[] {
     if (!this.tree) return [];
     return flattenTree(this.tree.root);
+  }
+
+  /**
+   * Get node ID for a DOM element.
+   * Returns null if element is not tracked.
+   * Uses WeakMap for O(1) lookup.
+   */
+  getElementId(element: HTMLElement): string | null {
+    return this.elementToId.get(element) ?? null;
   }
 
   // ===========================================================================
@@ -444,12 +469,22 @@ export class TreeTracker extends EventTarget {
     // Double-RAF: wait for framework batch + browser render
     this.rafId = requestAnimationFrame(() => {
       this.rafId = requestAnimationFrame(() => {
+        // Clear timeout when RAF fires to prevent double processing
+        if (this.timeoutId) {
+          clearTimeout(this.timeoutId);
+          this.timeoutId = null;
+        }
         this.processMutationBatch();
       });
     });
 
-    // Fallback timeout (100ms)
+    // Fallback timeout (100ms) - only fires if RAF is blocked
     this.timeoutId = window.setTimeout(() => {
+      // Clear RAF if timeout fires first
+      if (this.rafId) {
+        cancelAnimationFrame(this.rafId);
+        this.rafId = null;
+      }
       this.processMutationBatch();
     }, 100);
   }
@@ -501,6 +536,8 @@ export class TreeTracker extends EventTarget {
 
         // Child list changes
         if (mutation.type === 'childList') {
+          let hasTextNodeChanges = false;
+
           for (const node of mutation.removedNodes) {
             if (node instanceof HTMLElement) {
               removedElements.add(node);
@@ -510,6 +547,9 @@ export class TreeTracker extends EventTarget {
                   removedElements.add(descendant);
                 }
               }
+            } else if (node.nodeType === Node.TEXT_NODE) {
+              // Text node removed - parent's content changed
+              hasTextNodeChanges = true;
             }
           }
 
@@ -522,6 +562,16 @@ export class TreeTracker extends EventTarget {
                   addedElements.add(descendant);
                 }
               }
+            } else if (node.nodeType === Node.TEXT_NODE) {
+              // Text node added - parent's content changed
+              hasTextNodeChanges = true;
+            }
+          }
+
+          // If text nodes changed, mark the parent element as updated
+          if (hasTextNodeChanges && mutation.target instanceof HTMLElement) {
+            if (!isHidden(mutation.target)) {
+              updatedElements.add(mutation.target);
             }
           }
         }
@@ -550,6 +600,19 @@ export class TreeTracker extends EventTarget {
       // 3. Match added elements against removed fingerprints (detect re-renders)
       const reRenderedMatches = this.detectReRenderedNodes(removedNodeIds, addedElements);
 
+      // DEBUG: Log matching statistics
+      if (this.config.debugMode && (removedNodeIds.size > 0 || addedElements.size > 0)) {
+        console.log('[TreeTracker] Mutation batch:', {
+          removed: removedNodeIds.size,
+          added: addedElements.size,
+          matched: reRenderedMatches.size,
+          unmatched: {
+            removed: removedNodeIds.size - reRenderedMatches.size,
+            added: addedElements.size - reRenderedMatches.size,
+          },
+        });
+      }
+
       // 4. Process re-rendered nodes (update reference, emit node-matched)
       for (const [nodeId, matchedElement] of reRenderedMatches) {
         removedNodeIds.delete(nodeId);
@@ -557,10 +620,14 @@ export class TreeTracker extends EventTarget {
 
         const tracked = this.nodeMap.get(nodeId);
         if (tracked) {
-          // Update reference
+          // Update reference and reverse lookup
           tracked.ref = new WeakRef(matchedElement);
           tracked.status = 'active';
           tracked.lostAt = null;
+          this.elementToId.set(matchedElement, nodeId);
+
+          // CRITICAL: Mark new DOM element as tracked (survives future mutations)
+          this.markElementTracked(matchedElement);
 
           // Cancel any pending grace period
           this.cancelGracePeriod(nodeId);
@@ -603,10 +670,6 @@ export class TreeTracker extends EventTarget {
               changes,
             });
           }
-
-          if (this.config.debugMode) {
-            console.log('[TreeTracker] Node re-matched:', nodeId, newLabel);
-          }
         }
       }
 
@@ -616,21 +679,30 @@ export class TreeTracker extends EventTarget {
       }
 
       // 6. Process truly new nodes (add to tree, emit node-added)
+      let newNodeCount = 0;
+      let skippedTrackedCount = 0;
       for (const element of addedElements) {
         // Skip if shouldn't be in tree
         const tag = element.tagName.toLowerCase();
         if (SKIP_TAGS.has(tag)) continue;
         if (isHidden(element)) continue;
 
-        // Skip if already tracked
-        if (this.isElementTracked(element)) continue;
+        // Skip if already tracked (use both WeakMap and attribute check)
+        if (this.elementToId.has(element) || this.isElementTracked(element)) {
+          skippedTrackedCount++;
+          continue;
+        }
 
         // Find parent in our tree
         const parentId = this.findParentNodeId(element);
         if (parentId) {
           this.addNodeToTree(element, parentId);
+          newNodeCount++;
         }
       }
+
+      // Modal detection: check if any added elements are modals
+      this.detectModalChanges(addedElements, removedElements);
 
       // 7. Process updated nodes (emit node-updated)
       for (const element of updatedElements) {
@@ -700,6 +772,9 @@ export class TreeTracker extends EventTarget {
 
   /**
    * Detect re-rendered nodes by matching removed fingerprints to added elements.
+   * Uses two strategies:
+   * 1. Full fingerprint matching (for high-confidence matches)
+   * 2. Structure-only matching (fallback for dynamic content)
    */
   private detectReRenderedNodes(
     removedNodeIds: Set<string>,
@@ -711,22 +786,25 @@ export class TreeTracker extends EventTarget {
       return matches;
     }
 
-    // Collect fingerprints from removed nodes
+    // Collect info from removed nodes
+    const removedNodes: Array<{ nodeId: string; tracked: TrackedNode }> = [];
     const removedFingerprints: ElementFingerprint[] = [];
     const fingerprintToId = new Map<string, string>();
 
     for (const nodeId of removedNodeIds) {
       const tracked = this.nodeMap.get(nodeId);
       if (tracked) {
+        removedNodes.push({ nodeId, tracked });
         removedFingerprints.push(tracked.node.fingerprint);
         fingerprintToId.set(tracked.node.fingerprint.id, nodeId);
       }
     }
 
-    // Convert added elements to array
     const candidateElements = Array.from(addedElements);
+    const usedElements = new Set<HTMLElement>();
+    const usedNodeIds = new Set<string>();
 
-    // Use batch matching
+    // Strategy 1: Full fingerprint matching (for high-confidence matches)
     const matchResults = matchAll(
       removedFingerprints,
       candidateElements,
@@ -734,19 +812,142 @@ export class TreeTracker extends EventTarget {
       this.config.confidenceThreshold
     );
 
-    // Process matches
-    const usedElements = new Set<HTMLElement>();
-    for (const [fpId, result] of matchResults) {
+    const sortedMatches = Array.from(matchResults.entries())
+      .filter(([, result]) => result !== null)
+      .sort((a, b) => (b[1]?.confidence ?? 0) - (a[1]?.confidence ?? 0));
+
+    for (const [fpId, result] of sortedMatches) {
       if (result && !usedElements.has(result.element)) {
         const nodeId = fingerprintToId.get(fpId);
-        if (nodeId) {
+        if (nodeId && !usedNodeIds.has(nodeId)) {
           matches.set(nodeId, result.element);
           usedElements.add(result.element);
+          usedNodeIds.add(nodeId);
+        }
+      }
+    }
+
+    // Strategy 2: Identifier-based matching (href, testId, name, ariaLabel)
+    // More reliable than structure for links and form elements
+    for (const { nodeId, tracked } of removedNodes) {
+      if (usedNodeIds.has(nodeId)) continue;
+
+      const fp = tracked.node.fingerprint;
+
+      for (const candidate of candidateElements) {
+        if (usedElements.has(candidate)) continue;
+        if (candidate.tagName.toLowerCase() !== fp.tagName) continue;
+
+        // Check stable identifiers
+        let matched = false;
+
+        // href for links (most reliable) - normalize before comparing
+        if (fp.href) {
+          const candidateHref = normalizeHref(candidate.getAttribute('href'));
+          if (candidateHref === fp.href) {
+            matched = true;
+          }
+        }
+        // data-testid
+        else if (fp.testId) {
+          const candidateTestId =
+            candidate.getAttribute('data-testid') ||
+            candidate.getAttribute('data-test') ||
+            candidate.getAttribute('data-cy');
+          if (candidateTestId === fp.testId) {
+            matched = true;
+          }
+        }
+        // name attribute for form elements
+        else if (fp.name && candidate.getAttribute('name') === fp.name) {
+          matched = true;
+        }
+        // aria-label
+        else if (fp.ariaLabel && candidate.getAttribute('aria-label') === fp.ariaLabel) {
+          matched = true;
+        }
+
+        if (matched) {
+          matches.set(nodeId, candidate);
+          usedElements.add(candidate);
+          usedNodeIds.add(nodeId);
+          break;
+        }
+      }
+    }
+
+    // Strategy 3: Structure-only matching for remaining unmatched nodes
+    // Only for elements without stable identifiers
+    for (const { nodeId, tracked } of removedNodes) {
+      if (usedNodeIds.has(nodeId)) continue;
+
+      const fp = tracked.node.fingerprint;
+
+      // Skip if element has stable identifiers (should have matched above)
+      if (fp.href || fp.testId || fp.name || fp.ariaLabel) continue;
+
+      // Find candidate with EXACT same position
+      for (const candidate of candidateElements) {
+        if (usedElements.has(candidate)) continue;
+        if (candidate.tagName.toLowerCase() !== fp.tagName) continue;
+
+        // Must have same sibling index
+        const candidateSiblingIndex = this.getSiblingIndex(candidate);
+        if (candidateSiblingIndex !== fp.siblingIndex) continue;
+
+        // Must have same child index
+        const candidateChildIndex = this.getChildIndex(candidate);
+        if (candidateChildIndex !== fp.childIndex) continue;
+
+        // Check ancestor path - tags AND indices must match
+        const fpAncestorPath = fp.ancestorPath.slice(0, 2);
+        if (fpAncestorPath.length < 1) continue;
+
+        let ancestorMatch = true;
+        let current: HTMLElement | null = candidate.parentElement;
+
+        for (let i = 0; i < fpAncestorPath.length && current; i++) {
+          const fpAncestor = fpAncestorPath[i];
+          const currentTag = current.tagName.toLowerCase();
+          const currentIndex = this.getSiblingIndex(current);
+
+          if (currentTag !== fpAncestor.tagName || currentIndex !== fpAncestor.index) {
+            ancestorMatch = false;
+            break;
+          }
+
+          current = current.parentElement;
+        }
+
+        if (ancestorMatch) {
+          matches.set(nodeId, candidate);
+          usedElements.add(candidate);
+          usedNodeIds.add(nodeId);
+          break;
         }
       }
     }
 
     return matches;
+  }
+
+  /**
+   * Get sibling index (position among same-tag siblings).
+   */
+  private getSiblingIndex(element: HTMLElement): number {
+    if (!element.parentElement) return 0;
+    const siblings = Array.from(element.parentElement.children).filter(
+      (el) => el.tagName === element.tagName
+    );
+    return siblings.indexOf(element);
+  }
+
+  /**
+   * Get child index (position among ALL siblings).
+   */
+  private getChildIndex(element: HTMLElement): number {
+    if (!element.parentElement) return 0;
+    return Array.from(element.parentElement.children).indexOf(element);
   }
 
   // ===========================================================================
@@ -773,24 +974,26 @@ export class TreeTracker extends EventTarget {
 
         // Check one more time if element reappeared
         const element = this.findElementByFingerprint(tracked.node.fingerprint);
-        if (!element || !element.isConnected) {
-          // Truly gone - emit removal
+
+        // CRITICAL: Check if found element is already tracked by a DIFFERENT node
+        // This prevents the bug where a new element (already added with new ID)
+        // is mistaken for the old element "reappearing"
+        const existingId = element ? this.elementToId.get(element) : undefined;
+        const isAlreadyTrackedByOther = existingId && existingId !== nodeId;
+
+        if (!element || !element.isConnected || isAlreadyTrackedByOther) {
+          // Truly gone (or replaced by new element) - emit removal
           tracked.status = 'lost';
           this.removeNodeFromTree(nodeId);
           this.emitEvent({ type: 'node-removed', nodeId });
-
-          if (this.config.debugMode) {
-            console.log('[TreeTracker] Node removed after grace period:', nodeId);
-          }
         } else {
-          // Reappeared - restore
+          // Reappeared - restore with updated reverse lookup
           tracked.ref = new WeakRef(element);
           tracked.status = 'active';
           tracked.lostAt = null;
-
-          if (this.config.debugMode) {
-            console.log('[TreeTracker] Node reappeared:', nodeId);
-          }
+          this.elementToId.set(element, nodeId);
+          // CRITICAL: Mark as tracked to prevent re-adding in future mutations
+          this.markElementTracked(element);
         }
       }
     }, this.config.gracePeriodMs);
@@ -829,10 +1032,11 @@ export class TreeTracker extends EventTarget {
     );
 
     if (match) {
-      // Update reference
+      // Update reference and reverse lookup
       tracked.ref = new WeakRef(match.element);
       tracked.status = 'active';
       tracked.lostAt = null;
+      this.elementToId.set(match.element, tracked.node.id);
 
       // Update fingerprint
       tracked.node.fingerprint = updateFingerprint(
@@ -882,6 +1086,12 @@ export class TreeTracker extends EventTarget {
   private populateNodeMap(node: TreeNode, parentId: string | null): void {
     // Find the corresponding DOM element
     const element = this.findElementByFingerprint(node.fingerprint);
+
+    // Mark element as tracked and add to reverse lookup
+    if (element) {
+      this.markElementTracked(element);
+      this.elementToId.set(element, node.id);
+    }
 
     const tracked: TrackedNode = {
       node,
@@ -947,6 +1157,31 @@ export class TreeTracker extends EventTarget {
     // Create fingerprint
     const fingerprint = createFingerprint(element);
 
+    // DUPLICATE PREVENTION: Check if any existing node has the same stable identifier
+    // This catches cases where our re-render matching missed an element
+    const existingDuplicate = this.findExistingNodeByIdentifiers(fingerprint);
+    if (existingDuplicate) {
+      if (this.config.debugMode) {
+        console.log('[TreeTracker] Prevented duplicate via identifier:', {
+          label,
+          href: fingerprint.href,
+          testId: fingerprint.testId,
+          existingId: existingDuplicate.node.id,
+        });
+      }
+      // Update existing node's reference instead of adding duplicate
+      existingDuplicate.ref = new WeakRef(element);
+      existingDuplicate.status = 'active';
+      existingDuplicate.lostAt = null;
+      this.elementToId.set(element, existingDuplicate.node.id);
+      this.markElementTracked(element);
+      // Update label and fingerprint
+      existingDuplicate.node.label = label;
+      existingDuplicate.node.fingerprint = fingerprint;
+      this.cancelGracePeriod(existingDuplicate.node.id);
+      return; // Don't add a new node
+    }
+
     // Create tree node
     const interactiveType = nodeType === 'interactive' ? getInteractiveType(element) : undefined;
     const formState = extractFormState(element);
@@ -973,6 +1208,10 @@ export class TreeTracker extends EventTarget {
     // Add to parent's children
     parentTracked.node.children.splice(index, 0, newNode);
 
+    // Mark element as tracked and add to reverse lookup
+    this.markElementTracked(element);
+    this.elementToId.set(element, newNode.id);
+
     // Add to nodeMap
     const tracked: TrackedNode = {
       node: newNode,
@@ -986,6 +1225,18 @@ export class TreeTracker extends EventTarget {
     // Update tree metadata
     this.tree.nodeCount++;
 
+    // DEBUG: Log new node additions
+    if (this.config.debugMode) {
+      console.log('[TreeTracker] Added NEW node:', {
+        id: newNode.id.slice(0, 8),
+        label: label.slice(0, 50),
+        tag,
+        href: fingerprint.href,
+        testId: fingerprint.testId,
+        totalNodes: this.tree.nodeCount,
+      });
+    }
+
     // Emit event
     this.emitEvent({
       type: 'node-added',
@@ -993,10 +1244,6 @@ export class TreeTracker extends EventTarget {
       parentId,
       index,
     });
-
-    if (this.config.debugMode) {
-      console.log('[TreeTracker] Node added:', newNode.id, label);
-    }
   }
 
   /**
@@ -1042,18 +1289,108 @@ export class TreeTracker extends EventTarget {
   }
 
   // ===========================================================================
+  // Modal Detection
+  // ===========================================================================
+
+  /** Track currently active modal element */
+  private activeModal: HTMLElement | null = null;
+
+  /**
+   * Check if an element is a modal dialog.
+   */
+  private isModalElement(el: HTMLElement): boolean {
+    return (
+      el.getAttribute('role') === 'dialog' ||
+      el.getAttribute('aria-modal') === 'true' ||
+      el.matches(CONFIG.modal.selectors)
+    );
+  }
+
+  /**
+   * Detect modal changes in added/removed elements.
+   */
+  private detectModalChanges(
+    addedElements: Set<HTMLElement>,
+    removedElements: Set<HTMLElement>
+  ): void {
+    // Check for modal closures first
+    if (this.activeModal) {
+      // Modal closed if it was removed OR is no longer connected to DOM
+      if (removedElements.has(this.activeModal) || !this.activeModal.isConnected) {
+        this.emitEvent({ type: 'modal-closed', modalId: this.getElementId(this.activeModal) });
+        this.activeModal = null;
+      }
+    }
+
+    // Check for new modals - both direct and descendants
+    if (!this.activeModal) {
+      for (const el of addedElements) {
+        // Check if the added element itself is a modal
+        if (this.isModalElement(el)) {
+          this.activeModal = el;
+          const modalId = this.getElementId(el);
+          this.emitEvent({ type: 'modal-opened', modalId, element: el });
+          break;
+        }
+
+        // Check descendants for modals (modal might be inside added container)
+        const modalDescendant = el.querySelector(CONFIG.modal.selectors) as HTMLElement | null;
+        if (modalDescendant) {
+          this.activeModal = modalDescendant;
+          const modalId = this.getElementId(modalDescendant);
+          this.emitEvent({ type: 'modal-opened', modalId, element: modalDescendant });
+          break;
+        }
+      }
+    }
+  }
+
+  // ===========================================================================
   // Helper Methods
   // ===========================================================================
 
   /**
    * Check if an element is already tracked.
+   * Uses data attribute as primary check (survives GC), falls back to nodeMap.
    */
   private isElementTracked(element: HTMLElement): boolean {
+    // Fast path: check data attribute
+    if (element.hasAttribute('data-klaro-tracked')) {
+      return true;
+    }
+
+    // Fallback: check nodeMap (for elements tracked before this fix)
     for (const tracked of this.nodeMap.values()) {
       const el = tracked.ref.deref();
       if (el === element) return true;
     }
     return false;
+  }
+
+  /**
+   * Mark an element as tracked.
+   */
+  private markElementTracked(element: HTMLElement): void {
+    element.setAttribute('data-klaro-tracked', 'true');
+  }
+
+  /**
+   * Mark all visible elements in a container as tracked.
+   * This prevents the mutation observer from re-adding existing elements.
+   */
+  private markAllVisibleElements(container: HTMLElement): void {
+    // Mark the container itself
+    if (!isHidden(container)) {
+      this.markElementTracked(container);
+    }
+
+    // Mark all descendants
+    const allElements = container.querySelectorAll('*');
+    for (const el of allElements) {
+      if (el instanceof HTMLElement && !isHidden(el)) {
+        this.markElementTracked(el);
+      }
+    }
   }
 
   /**
@@ -1064,6 +1401,64 @@ export class TreeTracker extends EventTarget {
       const el = tracked.ref.deref();
       if (el === element) return id;
     }
+    return null;
+  }
+
+  /**
+   * Find an existing node by stable identifiers (href, testId, name, ariaLabel).
+   * Used to prevent duplicates when re-render matching misses an element.
+   *
+   * AGGRESSIVE MODE: Matches ANY node with same identifier, regardless of element state.
+   * This prevents duplicates even when the old element hasn't been GC'd yet.
+   */
+  private findExistingNodeByIdentifiers(fingerprint: ElementFingerprint): TrackedNode | null {
+    // Only check if we have a stable identifier to match
+    const hasStableId =
+      fingerprint.href || fingerprint.testId || fingerprint.name || fingerprint.ariaLabel;
+    if (!hasStableId) return null;
+
+    for (const tracked of this.nodeMap.values()) {
+      // Must be same tag
+      if (tracked.node.tagName !== fingerprint.tagName) continue;
+
+      const existingFp = tracked.node.fingerprint;
+      const existingEl = tracked.ref.deref();
+
+      // Check if this is a candidate for update (stale element or in grace period)
+      const isStale = !existingEl || !existingEl.isConnected;
+      const isSearching = tracked.status === 'searching';
+      const canUpdate = isStale || isSearching;
+
+      // Check stable identifiers - if match found, either update or skip
+      let identifierMatch = false;
+
+      if (fingerprint.href && existingFp.href === fingerprint.href) {
+        identifierMatch = true;
+      } else if (fingerprint.testId && existingFp.testId === fingerprint.testId) {
+        identifierMatch = true;
+      } else if (fingerprint.name && existingFp.name === fingerprint.name) {
+        identifierMatch = true;
+      } else if (fingerprint.ariaLabel && existingFp.ariaLabel === fingerprint.ariaLabel) {
+        identifierMatch = true;
+      }
+
+      if (identifierMatch) {
+        // If element is stale or searching, we can update it
+        if (canUpdate) {
+          return tracked;
+        }
+        // If element is active with same identifier, it's a TRUE duplicate in the DOM
+        // Return null to allow adding (the DOM actually has two elements with same id)
+        // But log this unusual case
+        if (this.config.debugMode) {
+          console.warn(
+            '[TreeTracker] True DOM duplicate detected:',
+            fingerprint.href || fingerprint.testId
+          );
+        }
+      }
+    }
+
     return null;
   }
 
@@ -1160,5 +1555,6 @@ export type {
   NodeType,
   InteractiveType,
   ActionResult,
+  ModalOpenedEvent,
+  ModalClosedEvent,
 } from './types';
-export { DEFAULT_TREE_TRACKER_CONFIG } from './types';
