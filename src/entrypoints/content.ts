@@ -1,15 +1,14 @@
 import { scanPage, scanPageContent, highlightElement, getElementLabel } from '../utils/dom-scanner';
-import { ElementTracker, type TrackedElement } from '../utils/element-tracker';
 import type { ScannedAction } from '../utils/dom-scanner';
-import { scanLandmarks, type ScannedLandmark } from '../utils/landmark-scanner';
+import { TreeTracker, type TreeNode, type DOMTree } from '../utils/tree-tracker';
 import { markAllText, removeMarks } from '../utils/tooltip-injector';
 
 // ============================================================================
 // GLOBAL STATE
 // ============================================================================
 
-// ElementTracker instance (fingerprint-based, survives DOM destruction)
-let tracker: ElementTracker | null = null;
+// TreeTracker instance (unified fingerprint-based tracking)
+let tracker: TreeTracker | null = null;
 
 // Track which elements have input listeners attached
 const inputListeners = new WeakMap<HTMLElement, boolean>();
@@ -25,19 +24,6 @@ function sendMessage(message: Record<string, unknown>) {
   browser.runtime.sendMessage(message).catch(() => {
     // Side panel or background may not be listening
   });
-}
-
-/**
- * Convert tracked elements to the ScannedAction format expected by the sidebar.
- */
-function trackedToActions(tracked: TrackedElement[]): ScannedAction[] {
-  return tracked
-    .filter((t) => t.status !== 'lost')
-    .map((t) => ({
-      id: t.fingerprint.id,
-      tag: t.fingerprint.tagName,
-      text: t.fingerprint.textContent.slice(0, 50),
-    }));
 }
 
 /**
@@ -79,7 +65,7 @@ function getInputState(element: HTMLElement): Record<string, unknown> {
 }
 
 /**
- * Attach input listeners to a tracked element for real-time sync
+ * Attach input listeners to an element for real-time sync
  */
 function attachInputListeners(element: HTMLElement, id: string) {
   if (inputListeners.has(element)) return;
@@ -109,11 +95,12 @@ function attachInputListeners(element: HTMLElement, id: string) {
 function attachAllInputListeners() {
   if (!tracker) return;
 
-  for (const tracked of tracker.getTrackedElements()) {
-    if (tracked.status === 'lost') continue;
-    const element = tracker.getElementById(tracked.fingerprint.id);
-    if (element) {
-      attachInputListeners(element, tracked.fingerprint.id);
+  for (const node of tracker.getAllNodes()) {
+    if (node.nodeType === 'interactive') {
+      const element = tracker.getElement(node.id);
+      if (element) {
+        attachInputListeners(element, node.id);
+      }
     }
   }
 }
@@ -161,13 +148,14 @@ function sendInitialStates() {
 
   const states: Record<string, Record<string, unknown>> = {};
 
-  for (const tracked of tracker.getTrackedElements()) {
-    if (tracked.status === 'lost') continue;
-    const element = tracker.getElementById(tracked.fingerprint.id);
-    if (element) {
-      const tag = element.tagName.toLowerCase();
-      if (['input', 'textarea', 'select'].includes(tag)) {
-        states[tracked.fingerprint.id] = getInputState(element);
+  for (const node of tracker.getAllNodes()) {
+    if (node.nodeType === 'interactive') {
+      const element = tracker.getElement(node.id);
+      if (element) {
+        const tag = element.tagName.toLowerCase();
+        if (['input', 'textarea', 'select'].includes(tag)) {
+          states[node.id] = getInputState(element);
+        }
       }
     }
   }
@@ -180,15 +168,28 @@ function sendInitialStates() {
   }
 }
 
+/**
+ * Convert tree nodes to legacy ScannedAction format for backwards compatibility
+ */
+function treeNodesToActions(nodes: TreeNode[]): ScannedAction[] {
+  return nodes
+    .filter((n) => n.nodeType === 'interactive')
+    .map((n) => ({
+      id: n.id,
+      tag: n.tagName,
+      text: n.label.slice(0, 50),
+    }));
+}
+
 // ============================================================================
-// ELEMENT TRACKER INITIALIZATION
+// TREE TRACKER INITIALIZATION
 // ============================================================================
 
 /**
- * Initialize ElementTracker for fingerprint-based tracking.
- * Survives DOM destruction by React/Vue/Angular.
+ * Initialize TreeTracker for unified DOM tracking.
+ * Handles both interactive element tracking and full tree mirroring.
  */
-async function initElementTracker() {
+async function initTreeTracker() {
   // Wait for document.body to be available
   if (!document.body) {
     await new Promise<void>((resolve) => {
@@ -202,64 +203,110 @@ async function initElementTracker() {
     });
   }
 
-  // Initialize ElementTracker
-  tracker = new ElementTracker({
+  // Initialize TreeTracker
+  tracker = new TreeTracker({
     confidenceThreshold: 0.6,
-    gracePeriodMs: 100,
+    gracePeriodMs: 150, // Slightly longer than ElementTracker's 100ms for React
     debugMode: false,
   });
 
-  // When elements are updated, notify sidebar and attach listeners
-  tracker.on('elements-updated', () => {
-    sendMessage({ type: 'PAGE_UPDATED' });
-    attachAllInputListeners();
+  // Forward tree-initialized event
+  tracker.on('tree-initialized', (event) => {
+    const detail = (event as CustomEvent).detail;
+    sendMessage({
+      type: 'TREE_SCANNED',
+      tree: detail.tree,
+    });
+
+    // Attach listeners to form elements
+    setTimeout(() => {
+      attachAllInputListeners();
+      sendInitialStates();
+    }, 100);
   });
 
-  // When a new element is found, notify sidebar with fingerprint for LLM evaluation
-  tracker.on('element-found', (event) => {
-    const element = (event as CustomEvent).detail.element;
-    const fingerprint = (event as CustomEvent).detail.fingerprint;
-    attachInputListeners(element, fingerprint.id);
-
-    // Get nearby text context for LLM evaluation
-    const nearbyText = getNearbyTextContext(element);
-
+  // Forward node-added event
+  tracker.on('node-added', (event) => {
+    const detail = (event as CustomEvent).detail;
     sendMessage({
-      type: 'ELEMENT_FOUND',
-      fingerprint,
-      nearbyText,
+      type: 'NODE_ADDED',
+      parentId: detail.parentId,
+      node: detail.node,
+      index: detail.index,
+    });
+
+    // Attach input listeners for interactive elements
+    if (detail.node.nodeType === 'interactive') {
+      const element = tracker?.getElement(detail.node.id);
+      if (element) {
+        attachInputListeners(element, detail.node.id);
+      }
+    }
+
+    // Notify for LLM evaluation (interactive elements only)
+    if (detail.node.nodeType === 'interactive') {
+      const element = tracker?.getElement(detail.node.id);
+      if (element) {
+        const nearbyText = getNearbyTextContext(element);
+        sendMessage({
+          type: 'ELEMENT_FOUND',
+          fingerprint: detail.node.fingerprint,
+          nearbyText,
+        });
+      }
+    }
+  });
+
+  // Forward node-removed event
+  tracker.on('node-removed', (event) => {
+    const detail = (event as CustomEvent).detail;
+    sendMessage({
+      type: 'NODE_REMOVED',
+      nodeId: detail.nodeId,
     });
   });
 
-  // When an element is re-matched, re-attach listeners and update sidebar
-  tracker.on('element-matched', (event) => {
-    const element = (event as CustomEvent).detail.element;
-    const fingerprint = (event as CustomEvent).detail.fingerprint;
-    const confidence = (event as CustomEvent).detail.confidence;
-    attachInputListeners(element, fingerprint.id);
-
-    // Notify sidebar of the re-match (text may have changed)
+  // Forward node-updated event
+  tracker.on('node-updated', (event) => {
+    const detail = (event as CustomEvent).detail;
     sendMessage({
-      type: 'ELEMENT_MATCHED',
-      fingerprint,
-      confidence,
+      type: 'NODE_UPDATED',
+      nodeId: detail.nodeId,
+      changes: detail.changes,
     });
   });
 
-  // When an element is lost, notify sidebar
-  tracker.on('element-lost', (event) => {
-    const fingerprint = (event as CustomEvent).detail.fingerprint;
+  // Forward node-matched event (re-render detected)
+  tracker.on('node-matched', (event) => {
+    const detail = (event as CustomEvent).detail;
     sendMessage({
-      type: 'ELEMENT_REMOVED',
-      id: fingerprint.id,
+      type: 'NODE_MATCHED',
+      nodeId: detail.nodeId,
+      confidence: detail.confidence,
+      changes: detail.changes,
     });
+
+    // Also send ELEMENT_MATCHED for backwards compatibility
+    const node = tracker?.getNode(detail.nodeId);
+    if (node && node.nodeType === 'interactive') {
+      sendMessage({
+        type: 'ELEMENT_MATCHED',
+        fingerprint: node.fingerprint,
+        confidence: detail.confidence,
+      });
+    }
   });
 
-  // Start tracking
+  // Handle errors
+  tracker.on('tree-error', (event) => {
+    const detail = (event as CustomEvent).detail;
+    console.error('[Klaro] TreeTracker error:', detail.error);
+  });
+
+  // Start tracking (this will emit tree-initialized)
   await tracker.start();
 
-  // Attach listeners to existing elements
-  attachAllInputListeners();
+  console.debug('[Klaro] TreeTracker initialized');
 }
 
 // ============================================================================
@@ -269,9 +316,9 @@ async function initElementTracker() {
 export default defineContentScript({
   matches: ['<all_urls>'],
   async main() {
-    // Initialize ElementTracker (waits for body)
+    // Initialize TreeTracker (waits for body)
     // Note: Event listener tracking is injected by background.ts via chrome.scripting.executeScript
-    await initElementTracker();
+    await initTreeTracker();
 
     // Mark all text blocks after page loads (tooltip feature)
     const initTooltips = () => {
@@ -319,8 +366,8 @@ export default defineContentScript({
             // Get page content (article, headings, pageCopy) from dom-scanner
             const content = scanPageContent();
 
-            // Get tracked actions from ElementTracker
-            const actions = tracker ? trackedToActions(tracker.getTrackedElements()) : [];
+            // Get tracked actions from TreeTracker
+            const actions = tracker ? treeNodesToActions(tracker.getAllNodes()) : [];
 
             // Send initial states for form elements
             setTimeout(() => sendInitialStates(), 100);
@@ -341,124 +388,130 @@ export default defineContentScript({
           return;
         }
 
-        // Landmark-based scan (new architecture: content organized by landmarks)
-        if (message.type === 'SCAN_LANDMARKS') {
+        // Hierarchical tree scan (full DOM tree mirroring)
+        if (message.type === 'SCAN_TREE') {
           try {
-            // Get tracked elements from ElementTracker
-            const trackedElements = tracker?.getTrackedElements() || [];
-            const trackedMap = new Map(
-              trackedElements.filter((t) => t.status !== 'lost').map((t) => [t.fingerprint.id, t])
-            );
+            // If tracker already has a tree, return it
+            // Otherwise, restart tracking to get a fresh tree
+            if (tracker) {
+              const tree = tracker.getTree();
+              if (tree) {
+                // Send initial states for form elements
+                setTimeout(() => sendInitialStates(), 100);
 
-            // Scan the REAL DOM for landmarks (not a clone, so element refs match)
-            // The scanner will skip boilerplate elements internally
-            const landmarks = scanLandmarks(document.body, trackedMap);
+                sendResponse({
+                  type: 'TREE_SCANNED',
+                  tree,
+                });
+                return;
+              }
 
-            // Convert to serializable format (remove element references)
-            const serializableLandmarks = landmarks.map((l) => ({
-              id: l.id,
-              type: l.type,
-              rawTitle: l.rawTitle,
-              blocks: l.blocks.map((b) => {
-                if (b.type === 'element') {
-                  // Keep fingerprint but make it serializable
-                  return {
-                    type: 'element' as const,
-                    elementId: b.elementId,
-                    fingerprint: b.fingerprint,
-                  };
-                }
-                return b;
-              }),
-            }));
-
-            // Send initial states for form elements
-            setTimeout(() => sendInitialStates(), 100);
-
-            sendResponse({
-              url: window.location.href,
-              title: document.title,
-              landmarks: serializableLandmarks,
-            });
+              // Restart tracking to get fresh tree
+              tracker.stop();
+              tracker.start().then((newTree) => {
+                sendResponse({
+                  type: 'TREE_SCANNED',
+                  tree: newTree,
+                });
+              });
+            } else {
+              sendResponse({
+                type: 'TREE_SCANNED',
+                tree: null,
+                error: 'Tracker not initialized',
+              });
+            }
           } catch (e) {
-            console.error('[Klaro] SCAN_LANDMARKS error:', e);
+            console.error('[Klaro] SCAN_TREE error:', e);
             sendResponse({
-              url: window.location.href,
-              title: document.title,
-              landmarks: [],
+              type: 'TREE_SCANNED',
+              tree: null,
               error: e instanceof Error ? e.message : 'Scan failed',
             });
           }
-          return;
+          return true; // Indicate async response
+        }
+
+        // Scroll to element and highlight it
+        if (message.type === 'SCROLL_TO_ELEMENT' && message.id) {
+          if (tracker) {
+            tracker.scrollToElement(message.id).then((result) => {
+              sendResponse({
+                type: 'SCROLL_COMPLETE',
+                success: result.success,
+                error: result.error,
+              });
+            });
+          } else {
+            sendResponse({
+              type: 'SCROLL_COMPLETE',
+              success: false,
+              error: 'Tracker not initialized',
+            });
+          }
+          return true; // Indicate async response
         }
 
         // ===== ELEMENT INTERACTIONS =====
 
         if (message.type === 'CLICK_ELEMENT' && message.id) {
-          const element = tracker?.getElementById(message.id);
-
-          if (element) {
-            element.click();
-            if (typeof element.focus === 'function') element.focus();
-            highlightElement(element);
-            sendResponse({ ok: true });
+          if (tracker) {
+            tracker.clickElement(message.id).then((result) => {
+              if (result.success) {
+                const element = tracker?.getElement(message.id!);
+                if (element) highlightElement(element);
+              }
+              sendResponse({ ok: result.success, error: result.error });
+            });
           } else {
-            sendResponse({ ok: false, error: 'Element not found' });
+            sendResponse({ ok: false, error: 'Tracker not initialized' });
           }
-          return;
+          return true; // Indicate async response
         }
 
         if (message.type === 'SET_INPUT_VALUE' && message.id && message.value !== undefined) {
-          const element = tracker?.getElementById(message.id) as
-            | HTMLInputElement
-            | HTMLTextAreaElement
-            | null;
-
-          if (element) {
-            element.focus();
-            element.value = message.value;
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-            highlightElement(element);
-            sendResponse({ ok: true });
+          if (tracker) {
+            tracker.setInputValue(message.id, message.value).then((result) => {
+              if (result.success) {
+                const element = tracker?.getElement(message.id!);
+                if (element) highlightElement(element);
+              }
+              sendResponse({ ok: result.success, error: result.error });
+            });
           } else {
-            sendResponse({ ok: false, error: 'Element not found' });
+            sendResponse({ ok: false, error: 'Tracker not initialized' });
           }
-          return;
+          return true; // Indicate async response
         }
 
         if (message.type === 'TOGGLE_CHECKBOX' && message.id) {
-          const element = tracker?.getElementById(message.id) as HTMLInputElement | null;
-
-          if (element) {
-            if (message.checked !== undefined) {
-              element.checked = message.checked;
-            } else {
-              element.checked = !element.checked;
-            }
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            highlightElement(element);
-            sendResponse({ ok: true });
+          if (tracker) {
+            tracker.toggleCheckbox(message.id, message.checked).then((result) => {
+              if (result.success) {
+                const element = tracker?.getElement(message.id!);
+                if (element) highlightElement(element);
+              }
+              sendResponse({ ok: result.success, error: result.error });
+            });
           } else {
-            sendResponse({ ok: false, error: 'Element not found' });
+            sendResponse({ ok: false, error: 'Tracker not initialized' });
           }
-          return;
+          return true; // Indicate async response
         }
 
         if (message.type === 'SET_SELECT_VALUE' && message.id && message.value !== undefined) {
-          const element = tracker?.getElementById(message.id) as HTMLSelectElement | null;
-
-          if (element) {
-            element.value = message.value;
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            highlightElement(element);
-            sendResponse({ ok: true });
+          if (tracker) {
+            tracker.setSelectValue(message.id, message.value).then((result) => {
+              if (result.success) {
+                const element = tracker?.getElement(message.id!);
+                if (element) highlightElement(element);
+              }
+              sendResponse({ ok: result.success, error: result.error });
+            });
           } else {
-            sendResponse({ ok: false, error: 'Element not found' });
+            sendResponse({ ok: false, error: 'Tracker not initialized' });
           }
-          return;
+          return true; // Indicate async response
         }
 
         // ===== TOOLTIP MANAGEMENT =====
@@ -472,7 +525,7 @@ export default defineContentScript({
         // ===== DEBUG MODE =====
 
         if (message.type === 'SET_DEBUG_MODE' && tracker) {
-          tracker.setDebugMode(message.enabled ?? false);
+          tracker.setConfig({ debugMode: message.enabled ?? false });
           sendResponse({ ok: true });
           return;
         }
@@ -481,12 +534,12 @@ export default defineContentScript({
 
         if (message.type === 'GET_TRACKER_STATUS') {
           if (tracker) {
-            const elements = tracker.getTrackedElements();
+            const nodes = tracker.getAllNodes();
             sendResponse({
               ok: true,
               trackerActive: true,
-              elementCount: elements.length,
-              elements: trackedToActions(elements),
+              elementCount: nodes.length,
+              elements: treeNodesToActions(nodes),
             });
           } else {
             sendResponse({

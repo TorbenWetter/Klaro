@@ -1,16 +1,10 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import type { ActionBinding } from '$lib/schemas/accessible-ui';
-  import type { ScanLandmarksResponse } from '$lib/schemas/landmark-section';
-  import type { ElementFingerprint } from '../../utils/element-tracker';
-  import { landmarksStore } from './stores/landmarks.svelte';
-  import {
-    evaluatePageImportance,
-    evaluateNewElement,
-    defaultImportance,
-    shouldExcludeFromLLM,
-  } from '../../utils/llm-service';
-  import LandmarkSection from './components/LandmarkSection.svelte';
+  import type { ScanTreeResponse, DOMTreeNode, DOMTreeNodeBase } from '$lib/schemas/dom-tree';
+  import type { ElementFingerprint } from '../../utils/element-tracker/types';
+  import { domTreeStore } from './stores/dom-tree.svelte';
+  import TreeView from './components/TreeView.svelte';
 
   // shadcn components
   import * as Alert from '$lib/components/ui/alert';
@@ -71,24 +65,47 @@
     states: Record<string, Record<string, unknown>>;
   }
 
-  interface ElementFoundMessage {
-    type: 'ELEMENT_FOUND';
-    fingerprint: ElementFingerprint;
-    nearbyText: string;
-  }
-
   interface ElementMatchedMessage {
     type: 'ELEMENT_MATCHED';
     fingerprint: ElementFingerprint;
     confidence: number;
   }
 
+  // Tree sync messages
+  interface NodeAddedMessage {
+    type: 'NODE_ADDED';
+    parentId: string;
+    node: DOMTreeNode;
+    index: number;
+  }
+
+  interface NodeRemovedMessage {
+    type: 'NODE_REMOVED';
+    nodeId: string;
+  }
+
+  interface NodeUpdatedMessage {
+    type: 'NODE_UPDATED';
+    nodeId: string;
+    changes: Partial<DOMTreeNodeBase>;
+  }
+
+  interface NodeMatchedMessage {
+    type: 'NODE_MATCHED';
+    nodeId: string;
+    confidence: number;
+    changes: Partial<DOMTreeNodeBase>;
+  }
+
   type ContentMessage =
     | StatePatchMessage
     | ElementRemovedMessage
     | InitialStateMessage
-    | ElementFoundMessage
-    | ElementMatchedMessage;
+    | ElementMatchedMessage
+    | NodeAddedMessage
+    | NodeRemovedMessage
+    | NodeUpdatedMessage
+    | NodeMatchedMessage;
 
   // =============================================================================
   // Helpers
@@ -149,60 +166,46 @@
   // Scanning
   // =============================================================================
 
-  async function performScan(tabId: number, url: string): Promise<void> {
-    // Request landmark scan from content script
+  async function performScan(tabId: number): Promise<void> {
     const response = (await browser.tabs.sendMessage(tabId, {
-      type: 'SCAN_LANDMARKS',
-    })) as ScanLandmarksResponse;
+      type: 'SCAN_TREE',
+    })) as ScanTreeResponse;
 
-    if (response.error) {
-      landmarksStore.setError(response.error);
+    if (response.error || !response.tree) {
+      domTreeStore.setError(response.error || 'Scan failed');
       return;
     }
 
-    // Initialize store with scanned landmarks
-    landmarksStore.initializeFromScan(
-      response.url,
-      response.title,
-      response.landmarks as any // Type coercion for serialized data
-    );
-
-    // Evaluate importance with LLM (runs in background)
-    try {
-      const llmResponse = await evaluatePageImportance(response.landmarks as any);
-      landmarksStore.applyLLMDecisions(llmResponse);
-    } catch (error) {
-      console.warn('[Klaro] LLM evaluation failed, using heuristics:', error);
-      // Store already has content, just won't have LLM-enhanced labels
-    }
+    // Initialize store with scanned tree
+    domTreeStore.initializeTree(response.tree);
   }
 
   async function scanCurrentTab(): Promise<void> {
     if (isOnCooldown) return;
 
-    landmarksStore.setLoading(true);
-    landmarksStore.setError(null);
+    domTreeStore.setLoading(true);
+    domTreeStore.setError(null);
     startCooldown();
 
     try {
       const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
 
       if (!tab?.id) {
-        landmarksStore.setError('No active tab found.');
+        domTreeStore.setError('No active tab found.');
         return;
       }
 
-      await performScan(tab.id, tab.url ?? '');
+      await performScan(tab.id);
     } catch (e) {
-      landmarksStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-      landmarksStore.reset();
+      domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+      domTreeStore.reset();
     } finally {
-      landmarksStore.setLoading(false);
+      domTreeStore.setLoading(false);
     }
   }
 
   async function handleUrlChange(newUrl: string): Promise<void> {
-    if (newUrl === landmarksStore.url) return;
+    if (newUrl === domTreeStore.url) return;
 
     if (urlChangeDebounceTimer) {
       clearTimeout(urlChangeDebounceTimer);
@@ -211,24 +214,24 @@
     urlChangeDebounceTimer = setTimeout(async () => {
       urlChangeDebounceTimer = null;
 
-      landmarksStore.setLoading(true);
-      landmarksStore.setError(null);
+      domTreeStore.setLoading(true);
+      domTreeStore.setError(null);
 
       try {
         const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
 
         if (!tab?.id) {
-          landmarksStore.setError('No active tab found.');
+          domTreeStore.setError('No active tab found.');
           return;
         }
 
-        landmarksStore.reset();
-        await performScan(tab.id, newUrl);
+        domTreeStore.reset();
+        await performScan(tab.id);
       } catch (e) {
-        landmarksStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-        landmarksStore.reset();
+        domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+        domTreeStore.reset();
       } finally {
-        landmarksStore.setLoading(false);
+        domTreeStore.setLoading(false);
       }
     }, URL_CHANGE_DEBOUNCE_MS);
   }
@@ -248,11 +251,20 @@
       case 'INITIAL_STATE':
         handleInitialState(message);
         break;
-      case 'ELEMENT_FOUND':
-        handleElementFound(message);
-        break;
       case 'ELEMENT_MATCHED':
         handleElementMatched(message);
+        break;
+      case 'NODE_ADDED':
+        handleNodeAdded(message);
+        break;
+      case 'NODE_REMOVED':
+        handleNodeRemoved(message);
+        break;
+      case 'NODE_UPDATED':
+        handleNodeUpdated(message);
+        break;
+      case 'NODE_MATCHED':
+        handleNodeMatched(message);
         break;
     }
   }
@@ -273,13 +285,13 @@
     elementStates.set(message.id, { ...current, ...message.changes });
     elementStates = new Map(elementStates);
 
-    landmarksStore.updateElementState(message.id, message.changes);
+    domTreeStore.updateElementState(message.id, message.changes);
   }
 
   function handleElementRemoved(message: ElementRemovedMessage): void {
     elementStates.delete(message.id);
     elementStates = new Map(elementStates);
-    landmarksStore.removeElement(message.id);
+    domTreeStore.removeNode(message.id);
   }
 
   function handleInitialState(message: InitialStateMessage): void {
@@ -287,72 +299,35 @@
       elementStates.set(elementId, state);
     }
     elementStates = new Map(elementStates);
-    landmarksStore.setInitialElementStates(message.states);
-  }
-
-  // Debounce timer for new element evaluation
-  let newElementDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-  const pendingNewElements: ElementFoundMessage[] = [];
-
-  async function handleElementFound(message: ElementFoundMessage): Promise<void> {
-    // Collect pending elements and debounce LLM calls
-    pendingNewElements.push(message);
-
-    if (newElementDebounceTimer) {
-      clearTimeout(newElementDebounceTimer);
-    }
-
-    newElementDebounceTimer = setTimeout(async () => {
-      newElementDebounceTimer = null;
-
-      // Process all pending elements
-      const toProcess = [...pendingNewElements];
-      pendingNewElements.length = 0;
-
-      for (const msg of toProcess) {
-        const { fingerprint, nearbyText } = msg;
-        const label =
-          fingerprint.ariaLabel || fingerprint.textContent || fingerprint.placeholder || '';
-
-        // Check if element should be excluded (token saving, not content filtering)
-        const exclusion = shouldExcludeFromLLM(fingerprint.tagName, label, fingerprint);
-        if (exclusion.exclude) {
-          console.debug(
-            `[Klaro] Excluding element from LLM: ${exclusion.reason}`,
-            label.slice(0, 30)
-          );
-          continue;
-        }
-
-        try {
-          // Try LLM evaluation
-          const decision = await evaluateNewElement(
-            fingerprint.tagName,
-            label,
-            fingerprint.nearestLandmark?.tagName || 'page',
-            nearbyText
-          );
-
-          landmarksStore.addElement(fingerprint, decision);
-        } catch (error) {
-          // Fail open: show the element with original label
-          console.warn('[Klaro] LLM evaluation failed, showing element anyway:', error);
-          const decision = defaultImportance(label);
-          landmarksStore.addElement(fingerprint, decision);
-        }
-      }
-    }, 300); // 300ms debounce
+    domTreeStore.setInitialElementStates(message.states);
   }
 
   function handleElementMatched(message: ElementMatchedMessage): void {
-    // Element was re-identified - update fingerprint and confidence
-    const { fingerprint, confidence } = message;
+    const { fingerprint } = message;
+    domTreeStore.updateNodeFingerprint(fingerprint.id, fingerprint);
+  }
 
-    // Update the fingerprint in section blocks (text may have changed)
-    landmarksStore.updateElementFingerprint(fingerprint.id, fingerprint);
+  // Tree sync handlers
+  function handleNodeAdded(message: NodeAddedMessage): void {
+    const { parentId, node, index } = message;
+    domTreeStore.addNode(parentId, node, index);
+  }
 
-    // Update confidence (may hide element if confidence dropped below 0.8)
-    landmarksStore.updateElementConfidence(fingerprint.id, confidence);
+  function handleNodeRemoved(message: NodeRemovedMessage): void {
+    const { nodeId } = message;
+    domTreeStore.removeNode(nodeId);
+    elementStates.delete(nodeId);
+    elementStates = new Map(elementStates);
+  }
+
+  function handleNodeUpdated(message: NodeUpdatedMessage): void {
+    const { nodeId, changes } = message;
+    domTreeStore.updateNode(nodeId, changes);
+  }
+
+  function handleNodeMatched(message: NodeMatchedMessage): void {
+    const { nodeId, changes } = message;
+    domTreeStore.updateNode(nodeId, changes);
   }
 
   // =============================================================================
@@ -387,29 +362,37 @@
     sendToActiveTab({ type: 'SET_SELECT_VALUE', id: elementId, value });
   }
 
+  function handleScrollTo(elementId: string): void {
+    sendToActiveTab({ type: 'SCROLL_TO_ELEMENT', id: elementId });
+  }
+
+  function handleToggleNode(nodeId: string): void {
+    domTreeStore.toggleNode(nodeId);
+  }
+
   // =============================================================================
   // Lifecycle
   // =============================================================================
 
   onMount(() => {
-    landmarksStore.setLoading(true);
-    landmarksStore.setError(null);
+    domTreeStore.setLoading(true);
+    domTreeStore.setError(null);
 
     const messageListener = (message: any) => {
       const handledTypes = [
         'STATE_PATCH',
         'ELEMENT_REMOVED',
         'INITIAL_STATE',
-        'ELEMENT_FOUND',
         'ELEMENT_MATCHED',
+        // Tree sync messages
+        'NODE_ADDED',
+        'NODE_REMOVED',
+        'NODE_UPDATED',
+        'NODE_MATCHED', // Re-render detection
       ];
 
       if (message.type && handledTypes.includes(message.type)) {
         handleContentMessage(message as ContentMessage);
-      }
-
-      if (message.type === 'PAGE_UPDATED') {
-        console.log('[Klaro] ElementTracker: page updated');
       }
     };
 
@@ -431,18 +414,18 @@
 
     browser.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
       if (!tab?.id) {
-        landmarksStore.setError('No active tab found.');
-        landmarksStore.setLoading(false);
+        domTreeStore.setError('No active tab found.');
+        domTreeStore.setLoading(false);
         return;
       }
 
       try {
-        await performScan(tab.id, tab.url ?? '');
+        await performScan(tab.id);
       } catch (e) {
-        landmarksStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-        landmarksStore.reset();
+        domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+        domTreeStore.reset();
       } finally {
-        landmarksStore.setLoading(false);
+        domTreeStore.setLoading(false);
       }
     });
 
@@ -466,30 +449,29 @@
       <h1 class="font-bold text-xl">Klaro</h1>
     </div>
     <div class="flex items-center gap-2">
-      {#if landmarksStore.hasExpandedSection}
+      {#if domTreeStore.tree}
         <Button
           variant="ghost"
           size="sm"
-          onclick={() => landmarksStore.collapseAll()}
-          title="Collapse all sections"
-        >
-          ↑↑
-        </Button>
-      {:else}
-        <Button
-          variant="ghost"
-          size="sm"
-          onclick={() => landmarksStore.expandAll()}
-          title="Expand all sections"
+          onclick={() => domTreeStore.expandAll()}
+          title="Expand all nodes"
         >
           ↓↓
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          onclick={() => domTreeStore.collapseAll()}
+          title="Collapse all nodes"
+        >
+          ↑↑
         </Button>
       {/if}
       <Button
         variant="outline"
         size="sm"
         onclick={() => scanCurrentTab()}
-        disabled={isOnCooldown || landmarksStore.loading}
+        disabled={isOnCooldown || domTreeStore.loading}
       >
         {#if isOnCooldown}
           {Math.ceil(cooldownRemaining / 1000)}s
@@ -502,28 +484,30 @@
 
   <!-- CONTENT -->
   <ScrollArea class="flex-1">
-    {#if landmarksStore.loading}
+    {#if domTreeStore.loading}
       <!-- Loading State -->
       <div class="p-4 space-y-4">
         <Skeleton class="h-8 w-3/4" />
         <div class="space-y-2">
-          <Skeleton class="h-12 w-full rounded-lg" />
-          <Skeleton class="h-12 w-full rounded-lg" />
-          <Skeleton class="h-12 w-full rounded-lg" />
+          <Skeleton class="h-6 w-full rounded" />
+          <Skeleton class="h-6 w-11/12 rounded ml-4" />
+          <Skeleton class="h-6 w-10/12 rounded ml-8" />
+          <Skeleton class="h-6 w-full rounded" />
+          <Skeleton class="h-6 w-11/12 rounded ml-4" />
         </div>
         <Separator class="my-4" />
         <div class="space-y-2">
-          <Skeleton class="h-12 w-full rounded-lg" />
-          <Skeleton class="h-12 w-full rounded-lg" />
+          <Skeleton class="h-6 w-full rounded" />
+          <Skeleton class="h-6 w-10/12 rounded ml-4" />
         </div>
       </div>
-    {:else if landmarksStore.error}
+    {:else if domTreeStore.error}
       <!-- Error State -->
       <div class="p-4">
         <Alert.Root variant="destructive">
           <Alert.Title>Unable to scan page</Alert.Title>
           <Alert.Description>
-            {landmarksStore.error}
+            {domTreeStore.error}
             <br /><br />
             Try refreshing the page or open a normal webpage (not chrome:// or extension pages).
           </Alert.Description>
@@ -541,45 +525,41 @@
           {/if}
         </Button>
       </div>
-    {:else if landmarksStore.sections.length === 0}
+    {:else if domTreeStore.tree}
+      <!-- Tree View -->
+      <div class="tree-container">
+        {#if domTreeStore.title}
+          <div class="p-4 pb-2">
+            <h2 class="text-lg font-semibold text-foreground">{domTreeStore.title}</h2>
+            <p class="text-sm text-muted-foreground">
+              {domTreeStore.nodeCount} elements
+            </p>
+          </div>
+          <Separator />
+        {/if}
+
+        <TreeView
+          root={domTreeStore.tree.root}
+          modalFocusMode={domTreeStore.modalFocusMode}
+          onToggle={handleToggleNode}
+          onAction={handleUIAction}
+          onInputChange={handleInputChange}
+          onToggleCheckbox={handleToggle}
+          onSelectChange={handleSelectChange}
+          onScrollTo={handleScrollTo}
+          {elementStates}
+        />
+      </div>
+    {:else}
       <!-- Empty State -->
       <div class="p-4">
         <Alert.Root>
           <Alert.Title>No content found</Alert.Title>
           <Alert.Description>
-            This page doesn't have any recognized content sections. Try refreshing or navigate to a
-            different page.
+            This page doesn't have any visible content. Try refreshing or navigate to a different
+            page.
           </Alert.Description>
         </Alert.Root>
-      </div>
-    {:else}
-      <!-- Landmark Sections -->
-      <div class="landmark-sections">
-        {#if landmarksStore.title}
-          <div class="p-4 pb-2">
-            <h2 class="text-lg font-semibold text-foreground">{landmarksStore.title}</h2>
-            {#if landmarksStore.totalItemCount > 0}
-              <p class="text-sm text-muted-foreground">
-                {landmarksStore.totalItemCount} interactive {landmarksStore.totalItemCount === 1
-                  ? 'element'
-                  : 'elements'}
-              </p>
-            {/if}
-          </div>
-          <Separator />
-        {/if}
-
-        {#each landmarksStore.sections as section (`${section.id}-${landmarksStore.version}`)}
-          <LandmarkSection
-            {section}
-            onToggle={landmarksStore.toggleSection}
-            onAction={handleUIAction}
-            onInputChange={handleInputChange}
-            onToggleCheckbox={handleToggle}
-            onSelectChange={handleSelectChange}
-            {elementStates}
-          />
-        {/each}
       </div>
     {/if}
   </ScrollArea>

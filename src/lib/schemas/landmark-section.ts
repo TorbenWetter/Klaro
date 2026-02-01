@@ -6,7 +6,7 @@
 
 import { z } from 'zod';
 import type { UINode } from './accessible-ui';
-import type { ElementFingerprint } from '../../utils/element-tracker';
+import type { ElementFingerprint } from '../../utils/element-tracker/types';
 
 // =============================================================================
 // Content Block Types

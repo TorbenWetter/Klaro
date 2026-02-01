@@ -84,9 +84,7 @@ export function getElementLabel(el: HTMLElement): string {
 
     return label.trim();
   }
-  return (
-    (el.getAttribute('aria-label') || el.innerText || '').trim()
-  );
+  return (el.getAttribute('aria-label') || el.innerText || '').trim();
 }
 
 /**
@@ -104,7 +102,7 @@ function getLabelForInput(input: HTMLInputElement): string {
   if (parentLabel) {
     // Get text content excluding the input itself
     const clone = parentLabel.cloneNode(true) as HTMLElement;
-    clone.querySelectorAll('input, select, textarea').forEach(el => el.remove());
+    clone.querySelectorAll('input, select, textarea').forEach((el) => el.remove());
     return clone.textContent?.trim() || '';
   }
 
@@ -171,21 +169,17 @@ export function scanPage(): ScanResult {
     : null;
 
   const headings: ScannedHeading[] = [];
-  const headingWalker = document.createTreeWalker(
-    document.body,
-    NodeFilter.SHOW_ELEMENT,
-    {
-      acceptNode(node) {
-        const el = node as HTMLElement;
-        const tag = el.tagName?.toLowerCase();
-        const level = tag?.match(/^h([1-6])$/)?.[1];
-        if (!level || el.offsetParent === null) return NodeFilter.FILTER_SKIP;
-        const text = (el.textContent ?? '').trim();
-        if (text.length === 0) return NodeFilter.FILTER_SKIP;
-        return NodeFilter.FILTER_ACCEPT;
-      },
+  const headingWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      const el = node as HTMLElement;
+      const tag = el.tagName?.toLowerCase();
+      const level = tag?.match(/^h([1-6])$/)?.[1];
+      if (!level || el.offsetParent === null) return NodeFilter.FILTER_SKIP;
+      const text = (el.textContent ?? '').trim();
+      if (text.length === 0) return NodeFilter.FILTER_SKIP;
+      return NodeFilter.FILTER_ACCEPT;
     },
-  );
+  });
   while (headingWalker.nextNode()) {
     const el = headingWalker.currentNode as HTMLElement;
     const tag = el.tagName.toLowerCase();
@@ -197,17 +191,13 @@ export function scanPage(): ScanResult {
   }
 
   const actions: ScannedAction[] = [];
-  const treeWalker = document.createTreeWalker(
-    document.body,
-    NodeFilter.SHOW_ELEMENT,
-    {
-      acceptNode(node) {
-        return isInteractiveAndVisible(node as HTMLElement)
-          ? NodeFilter.FILTER_ACCEPT
-          : NodeFilter.FILTER_SKIP;
-      },
+  const treeWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      return isInteractiveAndVisible(node as HTMLElement)
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_SKIP;
     },
-  );
+  });
 
   while (treeWalker.nextNode()) {
     const el = treeWalker.currentNode as HTMLElement;
@@ -220,37 +210,31 @@ export function scanPage(): ScanResult {
 
   // Build page copy in document order: headings, text blocks, actions interleaved
   const pageCopy: PageBlock[] = [];
-  const copyWalker = document.createTreeWalker(
-    document.body,
-    NodeFilter.SHOW_ELEMENT,
-    {
-      acceptNode(node) {
-        const el = node as HTMLElement;
-        const tag = el.tagName?.toLowerCase();
-        if (!tag || el.offsetParent === null) return NodeFilter.FILTER_SKIP;
-        if (tag.match(/^h[1-6]$/)) {
-          const t = (el.textContent ?? '').trim();
-          return t.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-        }
-        // Always include visible inputs, textareas, selects
-        if (tag === 'input' || tag === 'textarea' || tag === 'select') {
-          const input = el as HTMLInputElement;
-          if (input.type === 'hidden') return NodeFilter.FILTER_SKIP;
-          return NodeFilter.FILTER_ACCEPT;
-        }
-        if (INTERACTIVE_TAGS.has(tag) || el.getAttribute?.('role') === 'button') {
-          return getElementLabel(el).length > 0
-            ? NodeFilter.FILTER_ACCEPT
-            : NodeFilter.FILTER_SKIP;
-        }
-        if (TEXT_BLOCK_TAGS.has(tag)) {
-          const t = (el.textContent ?? '').trim();
-          return t.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-        }
-        return NodeFilter.FILTER_SKIP;
-      },
+  const copyWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      const el = node as HTMLElement;
+      const tag = el.tagName?.toLowerCase();
+      if (!tag || el.offsetParent === null) return NodeFilter.FILTER_SKIP;
+      if (tag.match(/^h[1-6]$/)) {
+        const t = (el.textContent ?? '').trim();
+        return t.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+      }
+      // Always include visible inputs, textareas, selects
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+        const input = el as HTMLInputElement;
+        if (input.type === 'hidden') return NodeFilter.FILTER_SKIP;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+      if (INTERACTIVE_TAGS.has(tag) || el.getAttribute?.('role') === 'button') {
+        return getElementLabel(el).length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+      }
+      if (TEXT_BLOCK_TAGS.has(tag)) {
+        const t = (el.textContent ?? '').trim();
+        return t.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+      }
+      return NodeFilter.FILTER_SKIP;
     },
-  );
+  });
 
   while (copyWalker.nextNode()) {
     const el = copyWalker.currentNode as HTMLElement;
@@ -281,89 +265,6 @@ export function scanPage(): ScanResult {
   }
 
   return { article, headings, actions, pageCopy };
-}
-
-/**
- * Highlights an element briefly and triggers click/focus. Call from content
- * script when the side panel requests a click by `data-acc-id`.
- *
- * NOTE: For ElementTracker integration, use tracker.clickElement() instead.
- */
-export function clickElementById(id: string): boolean {
-  const el = document.querySelector<HTMLElement>(
-    `[${ACTION_DATA_ATTR}="${id}"]`,
-  );
-  if (!el) return false;
-  el.click();
-  if (typeof el.focus === 'function') el.focus();
-  highlightElement(el);
-  return true;
-}
-
-/**
- * Sets the value of an input/textarea element and dispatches appropriate events.
- */
-export function setInputValue(id: string, value: string): boolean {
-  const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(
-    `[${ACTION_DATA_ATTR}="${id}"]`,
-  );
-  if (!el) return false;
-
-  // Focus the element first
-  el.focus();
-
-  // Set the value
-  el.value = value;
-
-  // Dispatch input and change events to trigger any listeners
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-
-  highlightElement(el);
-  return true;
-}
-
-/**
- * Toggles a checkbox or switch element.
- */
-export function checkboxToggle(id: string, checked?: boolean): boolean {
-  const el = document.querySelector<HTMLInputElement>(
-    `[${ACTION_DATA_ATTR}="${id}"]`,
-  );
-  if (!el) return false;
-
-  // If checked is provided, set to that value; otherwise toggle
-  if (checked !== undefined) {
-    el.checked = checked;
-  } else {
-    el.checked = !el.checked;
-  }
-
-  // Dispatch change event
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-
-  highlightElement(el);
-  return true;
-}
-
-/**
- * Sets the value of a select element.
- */
-export function setSelectValue(id: string, value: string): boolean {
-  const el = document.querySelector<HTMLSelectElement>(
-    `[${ACTION_DATA_ATTR}="${id}"]`,
-  );
-  if (!el) return false;
-
-  el.value = value;
-
-  // Dispatch change event
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-
-  highlightElement(el);
-  return true;
 }
 
 /**
@@ -398,21 +299,17 @@ export function scanPageContent(): PageContentResult {
     : null;
 
   const headings: ScannedHeading[] = [];
-  const headingWalker = document.createTreeWalker(
-    document.body,
-    NodeFilter.SHOW_ELEMENT,
-    {
-      acceptNode(node) {
-        const el = node as HTMLElement;
-        const tag = el.tagName?.toLowerCase();
-        const level = tag?.match(/^h([1-6])$/)?.[1];
-        if (!level || el.offsetParent === null) return NodeFilter.FILTER_SKIP;
-        const text = (el.textContent ?? '').trim();
-        if (text.length === 0) return NodeFilter.FILTER_SKIP;
-        return NodeFilter.FILTER_ACCEPT;
-      },
+  const headingWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      const el = node as HTMLElement;
+      const tag = el.tagName?.toLowerCase();
+      const level = tag?.match(/^h([1-6])$/)?.[1];
+      if (!level || el.offsetParent === null) return NodeFilter.FILTER_SKIP;
+      const text = (el.textContent ?? '').trim();
+      if (text.length === 0) return NodeFilter.FILTER_SKIP;
+      return NodeFilter.FILTER_ACCEPT;
     },
-  );
+  });
   while (headingWalker.nextNode()) {
     const el = headingWalker.currentNode as HTMLElement;
     const tag = el.tagName.toLowerCase();
@@ -426,26 +323,22 @@ export function scanPageContent(): PageContentResult {
   // Build page copy in document order: headings and text blocks
   // (actions will be added by the caller from ElementTracker)
   const pageCopy: PageBlock[] = [];
-  const copyWalker = document.createTreeWalker(
-    document.body,
-    NodeFilter.SHOW_ELEMENT,
-    {
-      acceptNode(node) {
-        const el = node as HTMLElement;
-        const tag = el.tagName?.toLowerCase();
-        if (!tag || el.offsetParent === null) return NodeFilter.FILTER_SKIP;
-        if (tag.match(/^h[1-6]$/)) {
-          const t = (el.textContent ?? '').trim();
-          return t.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-        }
-        if (TEXT_BLOCK_TAGS.has(tag)) {
-          const t = (el.textContent ?? '').trim();
-          return t.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-        }
-        return NodeFilter.FILTER_SKIP;
-      },
+  const copyWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      const el = node as HTMLElement;
+      const tag = el.tagName?.toLowerCase();
+      if (!tag || el.offsetParent === null) return NodeFilter.FILTER_SKIP;
+      if (tag.match(/^h[1-6]$/)) {
+        const t = (el.textContent ?? '').trim();
+        return t.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+      }
+      if (TEXT_BLOCK_TAGS.has(tag)) {
+        const t = (el.textContent ?? '').trim();
+        return t.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+      }
+      return NodeFilter.FILTER_SKIP;
     },
-  );
+  });
 
   while (copyWalker.nextNode()) {
     const el = copyWalker.currentNode as HTMLElement;

@@ -1,284 +1,173 @@
-import { minimizeForLLM } from './minimize-dom';
-import { getGeminiSimplify, callGemini } from './gemini';
-import type { ArticleResult, ScannedAction } from './dom-scanner';
-import type { ScannedLandmark } from './landmark-scanner';
-import type {
-  LLMPageResponse,
-  LLMElementResponse,
-  ElementDecision,
-} from '$lib/schemas/landmark-section';
-import {
-  LLMPageResponse as LLMPageResponseSchema,
-  LLMElementResponse as LLMElementResponseSchema,
-} from '$lib/schemas/landmark-section';
-import { landmarksToPrompt } from './landmark-scanner';
+/**
+ * LLM Service for Tree Label Enhancement
+ *
+ * Provides human-readable labels for DOM tree nodes using Gemini.
+ * Aligned with spec: Phase 6 - Smart Collapse & LLM
+ */
 
-export interface LLMSimplificationResult {
-  summary: string;
-  priorityIds: string[];
-}
+import { callGemini } from './gemini';
+import type { DOMTreeNode, LLMLabelResponse } from '$lib/schemas/dom-tree';
+import { LLMLabelResponse as LLMLabelResponseSchema } from '$lib/schemas/dom-tree';
 
-function heuristicFallback(
-  article: ArticleResult | null,
-  actions: ScannedAction[]
-): LLMSimplificationResult {
-  const text = article?.textContent ?? '';
-  const summary =
-    text.length > 0
-      ? `Here is the main point: ${text.slice(0, 150).trim()}...`
-      : 'No article found. This might be a tool or app.';
-
-  const priorityKeywords = [
-    'sign in',
-    'log in',
-    'login',
-    'search',
-    'buy',
-    'submit',
-    'continue',
-    'next',
-    'send',
-  ];
-  const scored = actions.map((a) => {
-    const lower = a.text.toLowerCase();
-    const score = priorityKeywords.some((k) => lower.includes(k)) ? 2 : 1;
-    return { ...a, score };
-  });
-  scored.sort((a, b) => b.score - a.score);
-  const priorityIds = scored.slice(0, 5).map((a) => a.id);
-
-  return { summary, priorityIds };
-}
+// =============================================================================
+// LLM Prompt (Single source of truth)
+// =============================================================================
 
 /**
- * Minimizes the page data for token efficiency, then calls Gemini in the frontend.
- * Falls back to heuristic summary/priorities if the API fails.
+ * System prompt for tree labeling.
+ * Aligned with spec: "provide a clear, concise label that describes what it is or does"
  */
-export async function getLLMSimplification(
-  article: ArticleResult | null,
-  actions: ScannedAction[]
-): Promise<LLMSimplificationResult> {
-  const minimized = minimizeForLLM(article, actions);
+const LABELING_PROMPT = `You are helping create accessible labels for webpage elements for seniors (65+).
 
-  try {
-    return await getGeminiSimplify(minimized);
-  } catch {
-    return heuristicFallback(article, actions);
-  }
-}
+For each element, provide a clear, concise label that describes what it is or does.
 
-// =============================================================================
-// Landmark-Based Importance Evaluation
-// =============================================================================
-
-/** System prompt for full page evaluation */
-const PAGE_IMPORTANCE_PROMPT = `You are helping simplify a webpage for seniors (65+).
-
-Given the page content organized by sections, decide which interactive elements are IMPORTANT for a senior to see, and provide enhanced labels that are clear and action-oriented.
-
-NOTE: Many pages do NOT have proper semantic HTML structure (no <nav>, <main>, <footer> tags). The sections may be inferred from class names or visual groupings. Work with whatever structure is provided.
-
-CRITERIA FOR IMPORTANCE (mark as important: true):
-- Primary actions: submit, register, login, search, checkout, buy, add to cart
-- Essential navigation: home, main menu items, back, previous/next
-- Form fields that must be filled (name, email, password, etc.)
-- Critical information links (help, contact, account)
-- Tab buttons that reveal important content
-
-EXCLUDE (mark as important: false):
-- Social media sharing buttons
-- Newsletter signup popups
-- Chat widgets
-- Advertising links
-- "Close" or "X" buttons for banners/popups
-- Secondary navigation: breadcrumbs, pagination beyond page 1-2, minor links
-- Developer/admin tools
-- Duplicate actions (e.g., multiple "Login" buttons - only mark one important)
-- Decorative elements
-
-LABEL ENHANCEMENT:
-- Use clear, action-oriented language
-- "Submit" → "Send your registration"
-- "Learn more" → "Read about our services"
-- Keep labels concise (under 40 characters)
-- Use simple words seniors understand
-- If the element has no clear label, describe what it does based on context
-
-FOR SECTIONS WITHOUT CLEAR NAMES:
-- Infer the purpose from content (e.g., section with form fields → "Registration Form")
-- Use descriptive titles like "Main Actions", "Page Navigation", "Contact Options"
+GUIDELINES:
+- Use simple, clear language
+- Describe the PURPOSE, not the HTML tag
+- For buttons/links: describe the action ("Sign in", "Go to cart")
+- For inputs: describe what to enter ("Your email", "Search products")
+- For containers: describe the content ("Main navigation", "Product list")
+- Keep labels under 50 characters
+- Use action verbs for interactive elements
+- Only include elements that need better labels
+- Skip elements that already have good labels
 
 Respond with JSON only, no markdown:
-{
-  "elements": {
-    "<fingerprint_id>": { "important": true/false, "label": "Enhanced label" }
-  },
-  "sections": {
-    "<landmark_type>": { "title": "Section Title", "description": "Brief description (optional)" }
-  }
-}`;
+{ "<element_id>": "label", ... }`;
 
-/** System prompt for single element evaluation */
-const ELEMENT_IMPORTANCE_PROMPT = `A new interactive element appeared on a webpage being simplified for seniors.
-
-Decide if this element is IMPORTANT for a senior to see, and if so, provide an enhanced label.
-
-CRITERIA FOR IMPORTANCE:
-- Primary actions (submit, login, search, buy)
-- Essential navigation
-- Form fields
-- Critical links
-
-EXCLUDE:
-- Social sharing
-- Ads
-- Secondary navigation
-- Duplicate actions
-
-Respond with JSON only:
-{ "important": true/false, "label": "Enhanced label if important" }`;
+// =============================================================================
+// Tree Label Enhancement
+// =============================================================================
 
 /**
- * Evaluate importance and generate enhanced labels for all elements on a page.
- * Used on initial page load.
+ * Collect nodes from tree for LLM processing.
+ * Prioritizes visible and interactive nodes that need better labels.
  */
-export async function evaluatePageImportance(
-  landmarks: ScannedLandmark[]
-): Promise<LLMPageResponse> {
-  // Convert landmarks to prompt format
-  const prompt = landmarksToPrompt(landmarks);
+function collectNodesForLLM(node: DOMTreeNode, collected: DOMTreeNode[], maxNodes: number): void {
+  if (collected.length >= maxNodes) return;
+
+  // Check if this node needs a better label
+  const needsBetterLabel =
+    node.label === node.tagName ||
+    node.label === 'div' ||
+    node.label === 'span' ||
+    node.label.length <= 2 ||
+    (node.nodeType === 'container' && !node.label.includes(' '));
+
+  // Include interactive nodes, visible nodes, and nodes needing better labels
+  if (node.nodeType === 'interactive' || node.isVisible || needsBetterLabel) {
+    collected.push(node);
+  }
+
+  for (const child of node.children) {
+    collectNodesForLLM(child, collected, maxNodes);
+  }
+}
+
+/**
+ * Convert tree nodes to prompt format for LLM.
+ */
+function nodesToPrompt(nodes: DOMTreeNode[]): string {
+  const lines: string[] = [];
+
+  for (const node of nodes) {
+    const indent = '  '.repeat(Math.min(node.depth, 4));
+    const type =
+      node.interactiveType || (node.headingLevel ? `h${node.headingLevel}` : node.nodeType);
+    const id = node.id.slice(0, 8);
+    lines.push(`${indent}[${id}] ${type}: "${node.label}"`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Enhance tree labels using LLM (batch call for initial scan).
+ * Called once when the tree is first scanned.
+ */
+export async function enhanceTreeLabels(
+  rootNode: DOMTreeNode,
+  pageTitle: string
+): Promise<LLMLabelResponse> {
+  // Collect nodes that might need better labels (limit to 100 for token efficiency)
+  const nodes: DOMTreeNode[] = [];
+  collectNodesForLLM(rootNode, nodes, 100);
+
+  if (nodes.length === 0) {
+    return { labels: {} };
+  }
+
+  const prompt = `Page: "${pageTitle}"
+
+Elements to label:
+${nodesToPrompt(nodes)}`;
 
   try {
     const response = await callGemini({
-      system: PAGE_IMPORTANCE_PROMPT,
+      system: LABELING_PROMPT,
       user: prompt,
       temperature: 0.2,
       maxTokens: 4096,
     });
 
-    // Parse and validate response
+    // Parse response - handle both flat format and nested format
     const parsed = JSON.parse(response.match(/\{[\s\S]*\}/)?.[0] || '{}');
-    const result = LLMPageResponseSchema.safeParse(parsed);
+
+    // If response has "labels" key, use that; otherwise treat whole object as labels
+    const labels = parsed.labels || parsed;
+
+    // Validate with schema
+    const result = LLMLabelResponseSchema.safeParse({ labels });
 
     if (result.success) {
       return result.data;
     }
 
     // Partial success - use what we can
-    console.warn('[Klaro] LLM response validation failed, using partial data:', result.error);
-    return {
-      elements: parsed.elements || {},
-      sections: parsed.sections || {},
-    };
+    console.warn('[Klaro] LLM response validation issue, using raw labels');
+    return { labels };
   } catch (error) {
-    console.error('[Klaro] evaluatePageImportance failed:', error);
-    // Return empty response - caller should use heuristic fallback
-    return { elements: {}, sections: {} };
+    console.error('[Klaro] enhanceTreeLabels failed:', error);
+    return { labels: {} };
   }
 }
 
 /**
- * Evaluate a single new element (for incremental updates).
- * Used when ElementTracker detects a new element.
+ * Enhance a single node's label using LLM.
+ * Called when a new node is added to the tree (one call per element).
  */
-export async function evaluateNewElement(
-  elementType: string,
-  currentLabel: string,
-  landmarkType: string,
-  nearbyText: string
-): Promise<LLMElementResponse> {
-  const context = `
-Element type: ${elementType}
-Current label: ${currentLabel}
-Section: ${landmarkType}
-Nearby text: ${nearbyText.slice(0, 200)}
-`.trim();
+export async function enhanceSingleNodeLabel(
+  node: DOMTreeNode,
+  pageTitle: string
+): Promise<{ label?: string; description?: string }> {
+  const type =
+    node.interactiveType || (node.headingLevel ? `h${node.headingLevel}` : node.nodeType);
+  const id = node.id.slice(0, 8);
+
+  const prompt = `Page: "${pageTitle}"
+
+New element:
+[${id}] ${type}: "${node.label}"
+
+Provide a better label if needed, or return the current label if it's already good.`;
 
   try {
     const response = await callGemini({
-      system: ELEMENT_IMPORTANCE_PROMPT,
-      user: context,
+      system: LABELING_PROMPT,
+      user: prompt,
       temperature: 0.2,
       maxTokens: 256,
     });
 
-    // Parse and validate response
+    // Parse response - expect { "<id>": "label" } format
     const parsed = JSON.parse(response.match(/\{[\s\S]*\}/)?.[0] || '{}');
-    const result = LLMElementResponseSchema.safeParse(parsed);
 
-    if (result.success) {
-      return result.data;
-    }
+    // Get the label from response (could be keyed by id or just "label")
+    const label = parsed[id] || parsed[node.id] || parsed.label || node.label;
 
-    // Fallback to marking as not important
-    console.warn('[Klaro] Single element LLM response validation failed:', result.error);
-    return { important: false, label: currentLabel };
+    return { label };
   } catch (error) {
-    console.error('[Klaro] evaluateNewElement failed:', error);
-    // Fallback - show the element but with original label
-    return { important: true, label: currentLabel };
+    console.error('[Klaro] enhanceSingleNodeLabel failed:', error);
+    return { label: node.label };
   }
-}
-
-/**
- * Check if an element should be excluded from LLM evaluation to save tokens.
- * This is purely technical filtering, NOT content-based filtering.
- *
- * Excludes:
- * - Elements with no text/label
- * - Known boilerplate (ads, tracking, cookie banners)
- * - Tiny elements (likely spacers or tracking pixels)
- */
-export function shouldExcludeFromLLM(
-  elementType: string,
-  label: string,
-  fingerprint?: { boundingBox?: { width: number; height: number } }
-): { exclude: boolean; reason?: string } {
-  // No text = can't be useful to show
-  if (!label || label.trim().length === 0) {
-    return { exclude: true, reason: 'no-text' };
-  }
-
-  // Very short meaningless labels (single char, just punctuation)
-  const trimmed = label.trim();
-  if (trimmed.length === 1 && /^[^\w]$/.test(trimmed)) {
-    return { exclude: true, reason: 'punctuation-only' };
-  }
-
-  // Tiny elements (likely tracking pixels or spacers)
-  // Use 1% of viewport as minimum, with 5px absolute floor
-  if (fingerprint?.boundingBox) {
-    const { width, height } = fingerprint.boundingBox;
-    const minDimension = Math.max(5, Math.min(window.innerWidth, window.innerHeight) * 0.01);
-    if (width < minDimension || height < minDimension) {
-      return { exclude: true, reason: 'too-small' };
-    }
-  }
-
-  // Known boilerplate patterns in labels (ads, tracking)
-  const boilerplatePatterns = [
-    /^ad[-_]?\d*$/i, // ad, ad-1, ad_2
-    /^advertisement$/i,
-    /^sponsored$/i,
-    /^tracking$/i,
-    /^\d+x\d+$/, // 300x250 (ad sizes)
-  ];
-
-  for (const pattern of boilerplatePatterns) {
-    if (pattern.test(trimmed)) {
-      return { exclude: true, reason: 'boilerplate-pattern' };
-    }
-  }
-
-  // Include everything else - let LLM decide
-  return { exclude: false };
-}
-
-/**
- * Default decision when LLM is unavailable.
- * FAIL OPEN: Show the element, let the user decide.
- * No content-based filtering - that's the LLM's job.
- */
-export function defaultImportance(label: string): ElementDecision {
-  return { important: true, label };
 }
