@@ -11,8 +11,13 @@
   import type { ElementFingerprint } from '../../utils/element-tracker/types';
   import { domTreeStore } from './stores/dom-tree-store.svelte';
   import { enhanceTreeWithLayout } from '../../utils/llm-service';
-  import { loadPreferences, applyPreferencesToDOM } from '../../utils/accessibility-preferences';
+  import {
+    loadPreferences,
+    applyPreferencesToDOM,
+    isOnboardingComplete,
+  } from '../../utils/accessibility-preferences';
   import TreeView from './components/TreeView.svelte';
+  import Onboarding from './components/Onboarding.svelte';
 
   // shadcn components
   import * as Alert from '$lib/components/ui/alert';
@@ -34,6 +39,9 @@
   // =============================================================================
   // State
   // =============================================================================
+
+  // Onboarding state: null = loading, true = show onboarding, false = show app
+  let showOnboarding = $state<boolean | null>(null);
 
   // Cooldown state
   let lastScanTime = $state(0);
@@ -545,16 +553,49 @@
   // Lifecycle
   // =============================================================================
 
-  onMount(async () => {
-    // Load and apply accessibility preferences first
+  /**
+   * Initialize the app after onboarding is complete
+   */
+  async function initializeApp(): Promise<void> {
+    // Load and apply accessibility preferences
     const prefs = await loadPreferences();
     applyPreferencesToDOM(prefs);
 
     domTreeStore.setLoading(true);
     domTreeStore.setError(null);
 
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) {
+      domTreeStore.setError('No active tab found.');
+      domTreeStore.setLoading(false);
+      isInitializing = false;
+      return;
+    }
+
+    currentTabId = tab.id;
+
+    try {
+      await performScan(tab.id);
+    } catch (e) {
+      domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+      domTreeStore.reset();
+    } finally {
+      domTreeStore.setLoading(false);
+      isInitializing = false;
+    }
+  }
+
+  /**
+   * Handle onboarding completion
+   */
+  async function handleOnboardingComplete(): Promise<void> {
+    showOnboarding = false;
+    await initializeApp();
+  }
+
+  onMount(async () => {
+    // Set up message listeners (always needed)
     const messageListener = (message: unknown) => {
-      // Type guard for message validation
       if (!message || typeof message !== 'object' || !('type' in message)) {
         return;
       }
@@ -566,13 +607,11 @@
         'ELEMENT_REMOVED',
         'INITIAL_STATE',
         'ELEMENT_MATCHED',
-        // Tree sync messages
         'TREE_SCANNED',
         'NODE_ADDED',
         'NODE_REMOVED',
         'NODE_UPDATED',
         'NODE_MATCHED',
-        // Modal messages
         'MODAL_OPENED',
         'MODAL_CLOSED',
       ];
@@ -589,49 +628,34 @@
       changeInfo: { url?: string; status?: string }
     ) => {
       if (!changeInfo.url) return;
-
       const [activeTab] = await browser.tabs.query({ active: true, currentWindow: true });
       if (!activeTab || activeTab.id !== tabId) return;
-
       handleUrlChange(changeInfo.url);
     };
 
     browser.tabs.onUpdated.addListener(tabUpdateListener);
 
-    // Listen for tab switches
     const tabActivatedListener = (activeInfo: { tabId: number; windowId: number }) => {
       handleTabActivated(activeInfo.tabId);
     };
 
     browser.tabs.onActivated.addListener(tabActivatedListener);
 
-    // Listen for tab removal to clean up cache
     const tabRemovedListener = (tabId: number) => {
       tabSessionCache.delete(tabId);
     };
 
     browser.tabs.onRemoved.addListener(tabRemovedListener);
 
-    browser.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
-      if (!tab?.id) {
-        domTreeStore.setError('No active tab found.');
-        domTreeStore.setLoading(false);
-        isInitializing = false;
-        return;
-      }
+    // Check if onboarding is complete
+    const onboardingDone = await isOnboardingComplete();
 
-      currentTabId = tab.id;
-
-      try {
-        await performScan(tab.id);
-      } catch (e) {
-        domTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
-        domTreeStore.reset();
-      } finally {
-        domTreeStore.setLoading(false);
-        isInitializing = false;
-      }
-    });
+    if (!onboardingDone) {
+      showOnboarding = true;
+    } else {
+      showOnboarding = false;
+      await initializeApp();
+    }
 
     return () => {
       browser.runtime.onMessage.removeListener(messageListener);
@@ -647,132 +671,146 @@
   });
 </script>
 
-<main class="h-screen flex flex-col bg-background text-foreground">
-  <!-- HEADER -->
-  <header class="p-4 bg-card border-b flex justify-between items-center sticky top-0 z-10">
-    <div class="flex items-center gap-2">
-      <img
-        src="/Klaro_Logo_Yellow.svg"
-        alt="Klaro"
-        class="h-9 w-9 shrink-0 rounded"
-        width="36"
-        height="36"
-      />
-      <h1 class="font-bold text-xl">Klaro</h1>
+{#if showOnboarding === null}
+  <!-- Loading state -->
+  <div class="h-screen flex items-center justify-center bg-background">
+    <div class="text-center">
+      <img src="/Klaro_Logo_Yellow.svg" alt="Klaro" class="h-12 w-12 mx-auto mb-3 animate-pulse" />
+      <p class="text-muted-foreground text-sm">Loading...</p>
     </div>
-    <div class="flex items-center gap-2">
-      {#if domTreeStore.tree}
-        <Button
-          variant="ghost"
-          size="sm"
-          onclick={() => domTreeStore.expandAll()}
-          title="Expand all"
-        >
-          ↓↓
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          onclick={() => domTreeStore.collapseAll()}
-          title="Collapse all"
-        >
-          ↑↑
-        </Button>
-      {/if}
-      <Button
-        variant="outline"
-        size="sm"
-        onclick={() => scanCurrentTab()}
-        disabled={isOnCooldown || domTreeStore.loading}
-      >
-        {#if isOnCooldown}
-          {Math.ceil(cooldownRemaining / 1000)}s
-        {:else}
-          ↻ Refresh
-        {/if}
-      </Button>
-    </div>
-  </header>
-
-  <!-- CONTENT -->
-  <ScrollArea class="flex-1">
-    {#if domTreeStore.loading}
-      <!-- Loading State -->
-      <div class="p-4 space-y-4">
-        <Skeleton class="h-8 w-3/4" />
-        <div class="space-y-2">
-          <Skeleton class="h-10 w-full rounded-md" />
-          <Skeleton class="h-6 w-11/12 rounded ml-4" />
-          <Skeleton class="h-6 w-10/12 rounded ml-4" />
-          <Skeleton class="h-10 w-full rounded-md" />
-          <Skeleton class="h-6 w-11/12 rounded ml-4" />
-        </div>
-        <Separator class="my-4" />
-        <div class="space-y-2">
-          <Skeleton class="h-10 w-full rounded-md" />
-          <Skeleton class="h-6 w-10/12 rounded ml-4" />
-        </div>
+  </div>
+{:else if showOnboarding}
+  <!-- Onboarding Flow -->
+  <Onboarding onComplete={handleOnboardingComplete} />
+{:else}
+  <!-- Main App -->
+  <main class="h-screen flex flex-col bg-background text-foreground sidepanel-content">
+    <!-- HEADER -->
+    <header class="p-4 bg-card border-b flex justify-between items-center sticky top-0 z-10">
+      <div class="flex items-center gap-2">
+        <img
+          src="/Klaro_Logo_Yellow.svg"
+          alt="Klaro"
+          class="h-9 w-9 shrink-0 rounded"
+          width="36"
+          height="36"
+        />
+        <h1 class="font-bold text-xl">Klaro</h1>
       </div>
-    {:else if domTreeStore.error}
-      <!-- Error State -->
-      <div class="p-4">
-        <Alert.Root variant="destructive">
-          <Alert.Title>Unable to scan page</Alert.Title>
-          <Alert.Description>
-            {domTreeStore.error}
-            <br /><br />
-            Try refreshing the page or open a normal webpage (not chrome:// or extension pages).
-          </Alert.Description>
-        </Alert.Root>
+      <div class="flex items-center gap-2">
+        {#if domTreeStore.tree}
+          <Button
+            variant="ghost"
+            size="sm"
+            onclick={() => domTreeStore.expandAll()}
+            title="Expand all"
+          >
+            ↓↓
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onclick={() => domTreeStore.collapseAll()}
+            title="Collapse all"
+          >
+            ↑↑
+          </Button>
+        {/if}
         <Button
           variant="outline"
-          class="mt-4"
+          size="sm"
           onclick={() => scanCurrentTab()}
-          disabled={isOnCooldown}
+          disabled={isOnCooldown || domTreeStore.loading}
         >
           {#if isOnCooldown}
-            Wait {Math.ceil(cooldownRemaining / 1000)}s
+            {Math.ceil(cooldownRemaining / 1000)}s
           {:else}
-            Try again
+            ↻ Refresh
           {/if}
         </Button>
       </div>
-    {:else if domTreeStore.root}
-      <!-- Tree View -->
-      <div class="tree-container">
-        {#if domTreeStore.title}
-          <div class="p-4 pb-2">
-            <h2 class="text-lg font-semibold text-foreground">{domTreeStore.title}</h2>
-            <p class="text-sm text-muted-foreground">
-              {domTreeStore.nodeCount} elements
-            </p>
-          </div>
-          <Separator />
-        {/if}
+    </header>
 
-        <TreeView
-          root={domTreeStore.root}
-          layoutStatus={domTreeStore.layoutStatus}
-          onToggle={handleToggleNode}
-          onAction={handleUIAction}
-          onInputChange={handleInputChange}
-          onToggleCheckbox={handleToggle}
-          onSelectChange={handleSelectChange}
-          onScrollTo={handleScrollTo}
-          elementStates={domTreeStore.elementStates}
-        />
-      </div>
-    {:else}
-      <!-- Empty State -->
-      <div class="p-4">
-        <Alert.Root>
-          <Alert.Title>No content found</Alert.Title>
-          <Alert.Description>
-            This page doesn't have any visible content. Try refreshing or navigate to a different
-            page.
-          </Alert.Description>
-        </Alert.Root>
-      </div>
-    {/if}
-  </ScrollArea>
-</main>
+    <!-- CONTENT -->
+    <ScrollArea class="flex-1">
+      {#if domTreeStore.loading}
+        <!-- Loading State -->
+        <div class="p-4 space-y-4">
+          <Skeleton class="h-8 w-3/4" />
+          <div class="space-y-2">
+            <Skeleton class="h-10 w-full rounded-md" />
+            <Skeleton class="h-6 w-11/12 rounded ml-4" />
+            <Skeleton class="h-6 w-10/12 rounded ml-4" />
+            <Skeleton class="h-10 w-full rounded-md" />
+            <Skeleton class="h-6 w-11/12 rounded ml-4" />
+          </div>
+          <Separator class="my-4" />
+          <div class="space-y-2">
+            <Skeleton class="h-10 w-full rounded-md" />
+            <Skeleton class="h-6 w-10/12 rounded ml-4" />
+          </div>
+        </div>
+      {:else if domTreeStore.error}
+        <!-- Error State -->
+        <div class="p-4">
+          <Alert.Root variant="destructive">
+            <Alert.Title>Unable to scan page</Alert.Title>
+            <Alert.Description>
+              {domTreeStore.error}
+              <br /><br />
+              Try refreshing the page or open a normal webpage (not chrome:// or extension pages).
+            </Alert.Description>
+          </Alert.Root>
+          <Button
+            variant="outline"
+            class="mt-4"
+            onclick={() => scanCurrentTab()}
+            disabled={isOnCooldown}
+          >
+            {#if isOnCooldown}
+              Wait {Math.ceil(cooldownRemaining / 1000)}s
+            {:else}
+              Try again
+            {/if}
+          </Button>
+        </div>
+      {:else if domTreeStore.root}
+        <!-- Tree View -->
+        <div class="tree-container">
+          {#if domTreeStore.title}
+            <div class="p-4 pb-2">
+              <h2 class="text-lg font-semibold text-foreground">{domTreeStore.title}</h2>
+              <p class="text-sm text-muted-foreground">
+                {domTreeStore.nodeCount} elements
+              </p>
+            </div>
+            <Separator />
+          {/if}
+
+          <TreeView
+            root={domTreeStore.root}
+            layoutStatus={domTreeStore.layoutStatus}
+            onToggle={handleToggleNode}
+            onAction={handleUIAction}
+            onInputChange={handleInputChange}
+            onToggleCheckbox={handleToggle}
+            onSelectChange={handleSelectChange}
+            onScrollTo={handleScrollTo}
+            elementStates={domTreeStore.elementStates}
+          />
+        </div>
+      {:else}
+        <!-- Empty State -->
+        <div class="p-4">
+          <Alert.Root>
+            <Alert.Title>No content found</Alert.Title>
+            <Alert.Description>
+              This page doesn't have any visible content. Try refreshing or navigate to a different
+              page.
+            </Alert.Description>
+          </Alert.Root>
+        </div>
+      {/if}
+    </ScrollArea>
+  </main>
+{/if}

@@ -91,6 +91,35 @@ export function applyPreferencesToDOM(prefs: AccessibilityPreferences): void {
 // =============================================================================
 
 const STORAGE_KEY = 'klaroAccessibilityPreferences';
+const ONBOARDING_KEY = 'klaroOnboardingComplete';
+
+/**
+ * Check if onboarding has been completed.
+ */
+export async function isOnboardingComplete(): Promise<boolean> {
+  try {
+    if (typeof browser !== 'undefined' && browser.storage?.local) {
+      const result = await browser.storage.local.get(ONBOARDING_KEY);
+      return result[ONBOARDING_KEY] === true;
+    }
+  } catch {
+    // Running outside extension context
+  }
+  return false;
+}
+
+/**
+ * Mark onboarding as complete.
+ */
+export async function setOnboardingComplete(): Promise<void> {
+  try {
+    if (typeof browser !== 'undefined' && browser.storage?.local) {
+      await browser.storage.local.set({ [ONBOARDING_KEY]: true });
+    }
+  } catch {
+    // Running outside extension context
+  }
+}
 
 /**
  * Load preferences from browser storage.

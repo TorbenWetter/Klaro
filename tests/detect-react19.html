@@ -1,0 +1,234 @@
+<!doctype html>
+<html>
+  <head>
+    <title>React 19 Detection Test</title>
+    <style>
+      body {
+        font-family: system-ui;
+        padding: 20px;
+        background: #1a1a1a;
+        color: #e0e0e0;
+      }
+      .result {
+        background: #2a2a2a;
+        padding: 10px;
+        margin: 10px 0;
+        border-radius: 5px;
+      }
+      .success {
+        border-left: 3px solid #4caf50;
+      }
+      .failure {
+        border-left: 3px solid #f44336;
+      }
+      pre {
+        white-space: pre-wrap;
+        font-size: 12px;
+      }
+      button {
+        padding: 10px 20px;
+        margin: 5px;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>React 19 Event Handler Detection Test</h1>
+    <p>This page tests whether our MAIN world script can detect React 19 event handlers.</p>
+
+    <div id="root"></div>
+    <div id="results"></div>
+
+    <!-- React 19 CDN -->
+    <script src="https://unpkg.com/react@19/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@19/umd/react-dom.development.js"></script>
+
+    <script>
+      // Wait for React to load
+      window.onload = function () {
+        // Create a simple React app with onClick handlers
+        const { useState, createElement: h } = React;
+        const { createRoot } = ReactDOM;
+
+        function App() {
+          const [count, setCount] = useState(0);
+
+          return h('div', { id: 'react-app' }, [
+            h('h2', { key: 'title' }, 'React 19 Test App'),
+
+            // Button with onClick
+            h(
+              'button',
+              {
+                key: 'btn1',
+                id: 'react-button',
+                onClick: () => setCount((c) => c + 1),
+              },
+              `Clicked ${count} times`
+            ),
+
+            // Div with onClick (like test-site CTA)
+            h(
+              'div',
+              {
+                key: 'div1',
+                id: 'react-div-clickable',
+                style: {
+                  padding: '10px',
+                  background: '#ff6b00',
+                  cursor: 'pointer',
+                  display: 'inline-block',
+                  margin: '10px',
+                },
+                onClick: () => alert('Div clicked!'),
+              },
+              'Click this div'
+            ),
+
+            // Span with onClick (like test-site tabs)
+            h(
+              'span',
+              {
+                key: 'span1',
+                id: 'react-span-clickable',
+                style: {
+                  padding: '10px',
+                  background: '#333',
+                  cursor: 'pointer',
+                  display: 'inline-block',
+                  margin: '10px',
+                },
+                onClick: () => alert('Span clicked!'),
+              },
+              'Click this span'
+            ),
+
+            // Div WITHOUT onClick (should NOT be detected)
+            h(
+              'div',
+              {
+                key: 'div2',
+                id: 'non-clickable-div',
+                style: {
+                  padding: '10px',
+                  background: '#222',
+                  cursor: 'pointer',
+                  display: 'inline-block',
+                  margin: '10px',
+                },
+              },
+              'No onClick (false positive)'
+            ),
+          ]);
+        }
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(h(App));
+
+        // Wait for React to mount, then test detection
+        setTimeout(runDetectionTests, 500);
+      };
+
+      function runDetectionTests() {
+        const results = [];
+
+        // Test elements
+        const testCases = [
+          { id: 'react-button', shouldHaveHandler: true, desc: 'Button with onClick' },
+          { id: 'react-div-clickable', shouldHaveHandler: true, desc: 'Div with onClick' },
+          { id: 'react-span-clickable', shouldHaveHandler: true, desc: 'Span with onClick' },
+          {
+            id: 'non-clickable-div',
+            shouldHaveHandler: false,
+            desc: 'Div without onClick (false positive test)',
+          },
+        ];
+
+        for (const test of testCases) {
+          const element = document.getElementById(test.id);
+          if (!element) {
+            results.push({ ...test, error: 'Element not found' });
+            continue;
+          }
+
+          // Analyze React internals
+          const keys = Object.keys(element);
+          const reactKeys = keys.filter((k) => k.startsWith('__react'));
+
+          const detection = {
+            reactProps: null,
+            reactFiber: null,
+            hasOnClick: false,
+          };
+
+          for (const key of keys) {
+            // Check __reactProps$ (React 17+)
+            if (key.startsWith('__reactProps$')) {
+              detection.reactProps = key;
+              const props = element[key];
+              if (props && props.onClick) {
+                detection.hasOnClick = true;
+              }
+            }
+
+            // Check __reactFiber$ (React 16+)
+            if (key.startsWith('__reactFiber$')) {
+              detection.reactFiber = key;
+              const fiber = element[key];
+              if (fiber) {
+                // Check memoizedProps
+                if (fiber.memoizedProps?.onClick) {
+                  detection.hasOnClick = true;
+                }
+                // Check pendingProps
+                if (fiber.pendingProps?.onClick) {
+                  detection.hasOnClick = true;
+                }
+              }
+            }
+          }
+
+          const success = detection.hasOnClick === test.shouldHaveHandler;
+          results.push({
+            ...test,
+            success,
+            reactKeys,
+            detection,
+            allKeys: keys,
+          });
+        }
+
+        // Display results
+        const resultsDiv = document.getElementById('results');
+        resultsDiv.innerHTML = '<h2>Detection Results</h2>';
+
+        for (const r of results) {
+          const div = document.createElement('div');
+          div.className = `result ${r.success ? 'success' : 'failure'}`;
+          div.innerHTML = `
+          <strong>${r.desc}</strong> (${r.id})<br>
+          <strong>Expected handler:</strong> ${r.shouldHaveHandler}<br>
+          <strong>Detected handler:</strong> ${r.detection?.hasOnClick ?? 'error'}<br>
+          <strong>Result:</strong> ${r.success ? '✓ PASS' : '✗ FAIL'}<br>
+          <details>
+            <summary>React Keys Found: ${r.reactKeys?.length ?? 0}</summary>
+            <pre>${JSON.stringify(r.detection, null, 2)}</pre>
+            <pre>All keys: ${r.allKeys?.join(', ')}</pre>
+          </details>
+        `;
+          resultsDiv.appendChild(div);
+        }
+
+        // Summary
+        const passed = results.filter((r) => r.success).length;
+        const total = results.length;
+        const summary = document.createElement('div');
+        summary.className = `result ${passed === total ? 'success' : 'failure'}`;
+        summary.innerHTML = `<h3>Summary: ${passed}/${total} tests passed</h3>`;
+        resultsDiv.insertBefore(summary, resultsDiv.firstChild.nextSibling);
+
+        console.log('Detection test results:', results);
+      }
+    </script>
+  </body>
+</html>
