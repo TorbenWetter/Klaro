@@ -48,6 +48,17 @@
   // Track elements being actively edited
   const activelyEditing = new Map<string, number>();
 
+  // Per-tab session cache for instant switching
+  interface TabSession {
+    tree: import('$lib/schemas/semantic-groups').SemanticTree | null;
+    elements: Map<string, TrackedElementData>;
+    url: string;
+    title: string;
+  }
+  const tabSessionCache = new Map<number, TabSession>();
+  let currentTabId: number | null = null;
+  let isInitializing = true; // Prevent race conditions during initial load
+
   // Derived state
   const isOnCooldown = $derived(cooldownRemaining > 0);
 
@@ -176,6 +187,92 @@
     }
   }
 
+  /**
+   * Deep clone an object (works with Svelte 5 proxies).
+   * Uses JSON serialization to strip proxy wrappers.
+   */
+  function deepClone<T>(obj: T): T {
+    return JSON.parse(JSON.stringify(obj));
+  }
+
+  /**
+   * Save current session to cache for the given tab.
+   */
+  function saveTabSession(tabId: number): void {
+    if (!semanticTreeStore.tree) return;
+
+    // Convert Map to array of entries for JSON serialization
+    const elementsArray = Array.from(semanticTreeStore.elements.entries());
+
+    tabSessionCache.set(tabId, {
+      tree: deepClone(semanticTreeStore.tree),
+      elements: new Map(elementsArray.map(([k, v]) => [k, deepClone(v)])),
+      url: semanticTreeStore.url,
+      title: semanticTreeStore.title,
+    });
+
+    // Limit cache size (keep last 10 tabs)
+    if (tabSessionCache.size > 10) {
+      const firstKey = tabSessionCache.keys().next().value;
+      if (firstKey !== undefined) {
+        tabSessionCache.delete(firstKey);
+      }
+    }
+  }
+
+  /**
+   * Restore session from cache for the given tab.
+   * Returns true if session was restored, false if cache miss.
+   */
+  async function restoreTabSession(tabId: number): Promise<boolean> {
+    const cached = tabSessionCache.get(tabId);
+
+    if (!cached || !cached.tree) {
+      return false;
+    }
+
+    // Restore cached session immediately
+    await semanticTreeStore.initializeTree(cached.tree, cached.elements);
+    return true;
+  }
+
+  /**
+   * Handle tab activation (user switched tabs).
+   */
+  async function handleTabActivated(tabId: number): Promise<void> {
+    // Skip during initial load to prevent race conditions
+    if (isInitializing) return;
+    if (tabId === currentTabId) return;
+
+    // Save current tab's session before switching
+    if (currentTabId !== null) {
+      saveTabSession(currentTabId);
+    }
+
+    currentTabId = tabId;
+
+    // Try to restore from cache first (instant switch)
+    const restored = await restoreTabSession(tabId);
+    if (restored) {
+      semanticTreeStore.setLoading(false);
+      return;
+    }
+
+    // No cache - need to scan
+    semanticTreeStore.setLoading(true);
+    semanticTreeStore.setError(null);
+    semanticTreeStore.reset();
+
+    try {
+      await performScan(tabId);
+    } catch (e) {
+      semanticTreeStore.setError(e instanceof Error ? e.message : 'Could not scan this page.');
+      semanticTreeStore.reset();
+    } finally {
+      semanticTreeStore.setLoading(false);
+    }
+  }
+
   function isElementBeingEdited(elementId: string): boolean {
     const lastEditTime = activelyEditing.get(elementId);
     if (!lastEditTime) return false;
@@ -263,11 +360,15 @@
     // Fall back to flat list if LLM fails
     if (!groups) {
       semanticTreeStore.initializeFlat(tree.url, tree.title, elements);
+      // Save to tab session cache
+      if (tabId) {
+        saveTabSession(tabId);
+      }
       return;
     }
 
     // Initialize semantic tree with LLM-generated groups
-    semanticTreeStore.initializeTree(
+    await semanticTreeStore.initializeTree(
       {
         groups,
         url: tree.url,
@@ -278,6 +379,11 @@
       },
       elements
     );
+
+    // Save to tab session cache
+    if (tabId) {
+      saveTabSession(tabId);
+    }
   }
 
   async function scanCurrentTab(): Promise<void> {
@@ -594,12 +700,29 @@
 
     browser.tabs.onUpdated.addListener(tabUpdateListener);
 
+    // Listen for tab switches
+    const tabActivatedListener = (activeInfo: { tabId: number; windowId: number }) => {
+      handleTabActivated(activeInfo.tabId);
+    };
+
+    browser.tabs.onActivated.addListener(tabActivatedListener);
+
+    // Listen for tab removal to clean up cache
+    const tabRemovedListener = (tabId: number) => {
+      tabSessionCache.delete(tabId);
+    };
+
+    browser.tabs.onRemoved.addListener(tabRemovedListener);
+
     browser.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
       if (!tab?.id) {
         semanticTreeStore.setError('No active tab found.');
         semanticTreeStore.setLoading(false);
+        isInitializing = false;
         return;
       }
+
+      currentTabId = tab.id;
 
       try {
         await performScan(tab.id);
@@ -608,12 +731,15 @@
         semanticTreeStore.reset();
       } finally {
         semanticTreeStore.setLoading(false);
+        isInitializing = false;
       }
     });
 
     return () => {
       browser.runtime.onMessage.removeListener(messageListener);
       browser.tabs.onUpdated.removeListener(tabUpdateListener);
+      browser.tabs.onActivated.removeListener(tabActivatedListener);
+      browser.tabs.onRemoved.removeListener(tabRemovedListener);
     };
   });
 
@@ -627,7 +753,13 @@
   <!-- HEADER -->
   <header class="p-4 bg-card border-b flex justify-between items-center sticky top-0 z-10">
     <div class="flex items-center gap-2">
-      <img src="/Klaro_Logo_Yellow.svg" alt="Klaro" class="h-9 w-9 shrink-0 rounded" width="36" height="36" />
+      <img
+        src="/Klaro_Logo_Yellow.svg"
+        alt="Klaro"
+        class="h-9 w-9 shrink-0 rounded"
+        width="36"
+        height="36"
+      />
       <h1 class="font-bold text-xl">Klaro</h1>
     </div>
     <div class="flex items-center gap-2">
