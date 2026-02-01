@@ -846,6 +846,16 @@ export function buildDOMTree(
     const tag = element.tagName.toLowerCase();
     if (SKIP_TAGS.has(tag)) return null;
 
+    // Skip Klaro-injected elements (Leichte Sprache badges, tooltips, etc.)
+    // These are UI elements injected by Klaro, not page content
+    if (
+      element.className &&
+      typeof element.className === 'string' &&
+      element.className.split(' ').some((c) => c.startsWith('klaro-'))
+    ) {
+      return null;
+    }
+
     // Skip elements with no content and no children
     const hasChildren = element.children.length > 0;
     const hasText = element.textContent?.trim();

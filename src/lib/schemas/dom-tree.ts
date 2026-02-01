@@ -26,6 +26,26 @@ export const NodeType = z.enum([
 export type NodeType = z.infer<typeof NodeType>;
 
 // =============================================================================
+// Layout Types (LLM-assigned)
+// =============================================================================
+
+/** Display mode for layout */
+export type DisplayMode = 'inline' | 'block' | 'flex-row' | 'flex-col' | 'grid';
+
+/** Spacing level */
+export type SpacingLevel = 'compact' | 'normal' | 'spacious';
+
+/** Emphasis level for visual weight */
+export type EmphasisLevel = 'critical' | 'high' | 'normal' | 'low';
+
+/** Layout hints assigned by LLM */
+export interface LayoutHints {
+  display?: DisplayMode;
+  emphasis?: EmphasisLevel;
+  spacing?: SpacingLevel;
+}
+
+// =============================================================================
 // DOM Tree Node
 // =============================================================================
 
@@ -61,6 +81,8 @@ export interface DOMTreeNodeBase {
   headingLevel?: 1 | 2 | 3 | 4 | 5 | 6;
   /** For images: alt text */
   altText?: string;
+  /** LLM-assigned layout hints for semantic styling */
+  layout?: LayoutHints;
 }
 
 /** Complete tree node with children */
@@ -129,18 +151,29 @@ export const DEFAULT_COLLAPSE_CONFIG: CollapseConfig = {
 };
 
 // =============================================================================
-// LLM Label Enhancement
+// LLM Response Types
 // =============================================================================
 
-/** LLM response for batch labeling */
-export const LLMLabelResponse = z.object({
-  /** Labels by element ID */
-  labels: z.record(z.string(), z.string()),
-  /** Optional descriptions by element ID */
-  descriptions: z.record(z.string(), z.string()).optional(),
+/** Layout hint schema for validation */
+const LayoutHintSchema = z.object({
+  display: z.enum(['inline', 'block', 'flex-row', 'flex-col', 'grid']).optional(),
+  emphasis: z.enum(['critical', 'high', 'normal', 'low']).optional(),
+  spacing: z.enum(['compact', 'normal', 'spacious']).optional(),
 });
 
-export type LLMLabelResponse = z.infer<typeof LLMLabelResponse>;
+/** LLM response for batch labeling and layout */
+export const LLMLayoutResponse = z.object({
+  /** Labels by element ID */
+  labels: z.record(z.string(), z.string()),
+  /** Layout hints by element ID */
+  layout: z.record(z.string(), LayoutHintSchema).optional(),
+});
+
+export type LLMLayoutResponse = z.infer<typeof LLMLayoutResponse>;
+
+/** Legacy alias for backwards compatibility */
+export const LLMLabelResponse = LLMLayoutResponse;
+export type LLMLabelResponse = LLMLayoutResponse;
 
 // =============================================================================
 // Message Types

@@ -10,6 +10,7 @@
   import { CONFIG } from '../../config';
   import type { ElementFingerprint } from '../../utils/element-tracker/types';
   import { domTreeStore } from './stores/dom-tree-store.svelte';
+  import { enhanceTreeWithLayout } from '../../utils/llm-service';
   import TreeView from './components/TreeView.svelte';
 
   // shadcn components
@@ -282,8 +283,11 @@
   }
 
   // =============================================================================
-  // Scanning (direct tree, no LLM grouping)
+  // Scanning with LLM Layout Enhancement
   // =============================================================================
+
+  const MAX_LLM_RETRIES = 3;
+  const LLM_RETRY_DELAY_MS = 1000;
 
   async function performScan(tabId: number): Promise<void> {
     // Get DOM tree from content script
@@ -296,12 +300,39 @@
       return;
     }
 
-    // Store tree directly - no LLM processing
+    // Store tree immediately (shows structure while LLM processes)
     domTreeStore.setTree(response.tree);
+
+    // Enhance with LLM layout hints (with retry)
+    await enhanceWithRetry(response.tree, MAX_LLM_RETRIES);
 
     // Save to tab session cache
     if (tabId) {
       saveTabSession(tabId);
+    }
+  }
+
+  /**
+   * Enhance tree with LLM layout hints, with retry on failure
+   */
+  async function enhanceWithRetry(tree: DOMTree, retriesLeft: number): Promise<void> {
+    domTreeStore.setLayoutStatus('loading');
+
+    try {
+      const layoutResponse = await enhanceTreeWithLayout(tree.root, tree.title, tree.url);
+      domTreeStore.applyLayoutHints(layoutResponse);
+      domTreeStore.setLayoutStatus('complete');
+    } catch (error) {
+      console.warn(`[Klaro] LLM enhancement failed, retries left: ${retriesLeft}`, error);
+
+      if (retriesLeft > 0) {
+        // Wait before retry
+        await new Promise((resolve) => setTimeout(resolve, LLM_RETRY_DELAY_MS));
+        await enhanceWithRetry(tree, retriesLeft - 1);
+      } else {
+        domTreeStore.setLayoutStatus('error');
+        console.error('[Klaro] LLM enhancement failed after all retries');
+      }
     }
   }
 
@@ -716,6 +747,7 @@
 
         <TreeView
           root={domTreeStore.root}
+          layoutStatus={domTreeStore.layoutStatus}
           onToggle={handleToggleNode}
           onAction={handleUIAction}
           onInputChange={handleInputChange}

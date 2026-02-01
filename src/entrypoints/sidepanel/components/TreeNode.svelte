@@ -3,8 +3,14 @@
   import { Button } from '$lib/components/ui/button';
   import { Label } from '$lib/components/ui/label';
   import { Checkbox } from '$lib/components/ui/checkbox';
-  import type { DOMTreeNode } from '$lib/schemas/dom-tree';
+  import type {
+    DOMTreeNode,
+    DisplayMode,
+    SpacingLevel,
+    EmphasisLevel,
+  } from '$lib/schemas/dom-tree';
   import type { ActionBinding } from '$lib/schemas/accessible-ui';
+  import { getPreferences } from '../../../utils/accessibility-preferences';
   // Self-import for recursion (Svelte 5 pattern)
   import TreeNode from './TreeNode.svelte';
 
@@ -13,6 +19,8 @@
     node: DOMTreeNode;
     /** Whether in modal focus mode */
     modalFocusMode?: boolean;
+    /** Whether to apply LLM layout hints */
+    useLayoutHints?: boolean;
     /** Handlers */
     onToggle: (nodeId: string) => void;
     onAction: (binding: ActionBinding) => void;
@@ -27,6 +35,7 @@
   let {
     node,
     modalFocusMode = false,
+    useLayoutHints = false,
     onToggle,
     onAction,
     onInputChange,
@@ -35,6 +44,65 @@
     onScrollTo,
     elementStates = new Map(),
   }: Props = $props();
+
+  // =============================================================================
+  // Layout Styling
+  // =============================================================================
+
+  const prefs = $derived(getPreferences());
+
+  // Layout hints from LLM
+  const display = $derived(node.layout?.display || 'block');
+  const emphasis = $derived(node.layout?.emphasis || 'normal');
+  const spacing = $derived(node.layout?.spacing || 'normal');
+
+  /** Get CSS classes based on display mode */
+  function getDisplayClasses(mode: DisplayMode): string {
+    switch (mode) {
+      case 'inline':
+        return 'display-inline';
+      case 'flex-row':
+        return 'display-flex-row';
+      case 'flex-col':
+        return 'display-flex-col';
+      case 'grid':
+        return 'display-grid';
+      default:
+        return 'display-block';
+    }
+  }
+
+  /** Get CSS classes based on emphasis level */
+  function getEmphasisClasses(level: EmphasisLevel): string {
+    switch (level) {
+      case 'critical':
+        return 'emphasis-critical';
+      case 'high':
+        return 'emphasis-high';
+      case 'low':
+        return 'emphasis-low';
+      default:
+        return '';
+    }
+  }
+
+  /** Get CSS classes based on spacing */
+  function getSpacingClasses(level: SpacingLevel): string {
+    switch (level) {
+      case 'compact':
+        return 'spacing-compact';
+      case 'spacious':
+        return 'spacing-spacious';
+      default:
+        return '';
+    }
+  }
+
+  const layoutClasses = $derived(
+    useLayoutHints
+      ? `${getDisplayClasses(display)} ${getEmphasisClasses(emphasis)} ${getSpacingClasses(spacing)}`.trim()
+      : ''
+  );
 
   /** Check if this node should be dimmed (modal mode but not in modal) */
   const isDimmed = $derived(modalFocusMode && !node.isModal);
@@ -133,12 +201,16 @@
 </script>
 
 <div
-  class="tree-node"
+  class="tree-node {layoutClasses}"
   class:dimmed={isDimmed}
+  class:layout-styled={useLayoutHints}
   role="treeitem"
   aria-selected="false"
   aria-expanded={isExpandable ? node.isExpanded : undefined}
   style="--indent: {indentPx}px"
+  data-display={display}
+  data-emphasis={emphasis}
+  data-spacing={spacing}
 >
   <!-- Node Header -->
   <div class="node-header" style="padding-left: {indentPx}px">
@@ -301,6 +373,7 @@
         <TreeNode
           node={child}
           {modalFocusMode}
+          {useLayoutHints}
           {onToggle}
           {onAction}
           {onInputChange}
@@ -320,6 +393,7 @@
         <TreeNode
           node={child}
           {modalFocusMode}
+          {useLayoutHints}
           {onToggle}
           {onAction}
           {onInputChange}
@@ -342,6 +416,112 @@
     opacity: 0.4;
     pointer-events: none;
   }
+
+  /* =============================================================================
+     Display Mode Styles (LLM-assigned layout)
+     ============================================================================= */
+
+  /* Inline: flows horizontally with siblings */
+  .tree-node.layout-styled.display-inline {
+    display: inline-flex;
+    flex-shrink: 0;
+  }
+
+  .tree-node.layout-styled.display-inline .node-header {
+    padding: 2px 6px;
+  }
+
+  /* Block: stacked vertically, full width (default) */
+  .tree-node.layout-styled.display-block {
+    display: block;
+    width: 100%;
+  }
+
+  /* Flex-row: children in horizontal row */
+  .tree-node.layout-styled.display-flex-row > .node-children {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: flex-start;
+    border-left: none;
+    margin-left: 0;
+    padding: 4px 0;
+  }
+
+  /* Flex-col: children stacked vertically */
+  .tree-node.layout-styled.display-flex-col > .node-children {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  /* Grid: children in grid layout */
+  .tree-node.layout-styled.display-grid > .node-children {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 8px;
+    border-left: none;
+    margin-left: 0;
+    padding: 4px 0;
+  }
+
+  /* =============================================================================
+     Emphasis Level Styles
+     ============================================================================= */
+
+  .tree-node.layout-styled.emphasis-critical {
+    background: hsl(var(--primary) / 0.1);
+    border-radius: 6px;
+    padding: 4px 8px;
+    margin: 2px 0;
+  }
+
+  .tree-node.layout-styled.emphasis-critical :global(button),
+  .tree-node.layout-styled.emphasis-critical :global(a) {
+    font-weight: 700;
+  }
+
+  .tree-node.layout-styled.emphasis-high {
+    font-weight: 600;
+  }
+
+  .tree-node.layout-styled.emphasis-low {
+    opacity: 0.75;
+  }
+
+  .tree-node.layout-styled.emphasis-low .node-header {
+    padding-top: 1px;
+    padding-bottom: 1px;
+    min-height: 24px;
+  }
+
+  /* =============================================================================
+     Spacing Level Styles
+     ============================================================================= */
+
+  .tree-node.layout-styled.spacing-compact .node-header {
+    padding: 1px 4px;
+    min-height: 22px;
+    gap: 2px;
+  }
+
+  .tree-node.layout-styled.spacing-compact > .node-children {
+    gap: 2px;
+  }
+
+  .tree-node.layout-styled.spacing-spacious .node-header {
+    padding: 6px 12px;
+    min-height: 36px;
+  }
+
+  .tree-node.layout-styled.spacing-spacious > .node-children {
+    gap: 12px;
+  }
+
+  /* =============================================================================
+     Base Node Styles
+     ============================================================================= */
 
   .node-header {
     display: flex;

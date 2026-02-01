@@ -1,11 +1,17 @@
 /**
  * DOM Tree Store
  *
- * Simple Svelte 5 runes-based store for holding the raw DOM tree
- * without LLM semantic grouping. Shows all content in original DOM hierarchy.
+ * Svelte 5 runes-based store for the DOM tree with LLM-powered semantic styling.
+ * Shows content with intelligent layout based on semantic roles and emphasis.
  */
 
-import type { DOMTree, DOMTreeNode } from '$lib/schemas/dom-tree';
+import type { DOMTree, DOMTreeNode, LayoutHints, LLMLayoutResponse } from '$lib/schemas/dom-tree';
+
+// =============================================================================
+// Types
+// =============================================================================
+
+type LayoutStatus = 'pending' | 'loading' | 'complete' | 'error';
 
 // =============================================================================
 // State
@@ -14,6 +20,10 @@ import type { DOMTree, DOMTreeNode } from '$lib/schemas/dom-tree';
 let tree = $state<DOMTree | null>(null);
 let loading = $state(false);
 let error = $state<string | null>(null);
+
+// Layout enhancement status
+let layoutStatus = $state<LayoutStatus>('pending');
+let layoutRetryCount = $state(0);
 
 // Element states for form synchronization (value, checked, etc.)
 let elementStates = $state<Map<string, Record<string, unknown>>>(new Map());
@@ -172,6 +182,70 @@ function removeNode(nodeId: string): void {
 }
 
 // =============================================================================
+// Layout Enhancement
+// =============================================================================
+
+/**
+ * Set layout enhancement status
+ */
+function setLayoutStatus(status: LayoutStatus): void {
+  layoutStatus = status;
+  if (status === 'loading') {
+    layoutRetryCount++;
+  } else if (status === 'complete' || status === 'pending') {
+    layoutRetryCount = 0;
+  }
+}
+
+/**
+ * Apply LLM layout response to tree nodes
+ */
+function applyLayoutHints(response: LLMLayoutResponse): void {
+  if (!tree) return;
+
+  // Apply labels
+  if (response.labels) {
+    for (const [shortId, label] of Object.entries(response.labels)) {
+      const node = findNodeByIdPrefix(shortId);
+      if (node) {
+        node.label = label;
+      }
+    }
+  }
+
+  // Apply layout hints
+  if (response.layout) {
+    for (const [shortId, hints] of Object.entries(response.layout)) {
+      const node = findNodeByIdPrefix(shortId);
+      if (node) {
+        node.layout = hints as LayoutHints;
+      }
+    }
+  }
+
+  layoutStatus = 'complete';
+  tree = { ...tree };
+}
+
+/**
+ * Find node by ID prefix (for LLM short IDs)
+ */
+function findNodeByIdPrefix(prefix: string): DOMTreeNode | null {
+  if (!tree) return null;
+
+  function find(node: DOMTreeNode): DOMTreeNode | null {
+    if (node.id.startsWith(prefix)) return node;
+    for (const child of node.children) {
+      const found = find(child);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  return find(tree.root);
+}
+
+// =============================================================================
 // Exported Store
 // =============================================================================
 
@@ -201,6 +275,12 @@ export const domTreeStore = {
   get root() {
     return tree?.root || null;
   },
+  get layoutStatus() {
+    return layoutStatus;
+  },
+  get layoutRetryCount() {
+    return layoutRetryCount;
+  },
 
   // Actions
   setTree,
@@ -214,4 +294,8 @@ export const domTreeStore = {
   findNode,
   updateNode,
   removeNode,
+
+  // Layout enhancement
+  setLayoutStatus,
+  applyLayoutHints,
 };
