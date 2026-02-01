@@ -11,6 +11,7 @@
   import type { ElementFingerprint } from '../../utils/element-tracker/types';
   import { domTreeStore } from './stores/dom-tree-store.svelte';
   import { enhanceTreeWithLayout } from '../../utils/llm-service';
+  import { loadPreferences, applyPreferencesToDOM } from '../../utils/accessibility-preferences';
   import TreeView from './components/TreeView.svelte';
 
   // shadcn components
@@ -544,7 +545,11 @@
   // Lifecycle
   // =============================================================================
 
-  onMount(() => {
+  onMount(async () => {
+    // Load and apply accessibility preferences first
+    const prefs = await loadPreferences();
+    applyPreferencesToDOM(prefs);
+
     domTreeStore.setLoading(true);
     domTreeStore.setError(null);
 
