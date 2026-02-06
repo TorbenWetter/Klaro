@@ -25,6 +25,12 @@
   let fontSize = $derived(FONT_SIZES[prefs.fontSize]);
   let lineHeight = $derived(lineHeights[prefs.spacingLevel]);
   let letterSpacing = $derived(letterSpacings[prefs.spacingLevel]);
+
+  let a11yCount = $derived(
+    content.a11yContent
+      ? (content.a11yContent.match(/<(p|li|h[1-6]|strong|a)\b/g) || []).length || 1
+      : 0
+  );
 </script>
 
 <article
@@ -50,6 +56,15 @@
   <div class="body">
     {@html content.content}
   </div>
+
+  {#if content.a11yContent}
+    <details class="a11y-section">
+      <summary>Accessibility elements ({a11yCount})</summary>
+      <div class="a11y-body">
+        {@html content.a11yContent}
+      </div>
+    </details>
+  {/if}
 </article>
 
 <style>
@@ -168,6 +183,27 @@
     height: auto;
     border-radius: 4px;
     margin: 0.75em 0;
+  }
+
+  .body :global(.img-row) {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding: 0.75em 0;
+    margin: 0;
+    scroll-snap-type: x mandatory;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .body :global(.img-row) :global(img) {
+    flex: 0 0 auto;
+    max-width: 60%;
+    max-height: 240px;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    margin: 0;
+    scroll-snap-align: start;
   }
 
   .body :global(a) {
@@ -328,5 +364,58 @@
     background: #333333;
     border-color: #666666;
     color: #ffffff;
+  }
+
+  /* Accessibility elements section */
+  .a11y-section {
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    padding: 0.5em 0.75em;
+    margin: 2em 0 0;
+    font-size: 0.85em;
+    color: #666666;
+  }
+
+  .a11y-section summary {
+    font-family:
+      system-ui,
+      -apple-system,
+      sans-serif;
+    font-weight: 600;
+    cursor: pointer;
+    color: #888888;
+    font-size: 0.9em;
+  }
+
+  .a11y-body {
+    margin-top: 0.75em;
+    padding-top: 0.75em;
+    border-top: 1px solid #e0e0e0;
+  }
+
+  .a11y-body :global(p) {
+    margin: 0 0 0.5em;
+  }
+
+  .a11y-body :global(a) {
+    color: #1a5fb4;
+    text-decoration: underline;
+  }
+
+  .reader-content[data-klaro-contrast='high'] .a11y-section {
+    border-color: #555555;
+    color: #999999;
+  }
+
+  .reader-content[data-klaro-contrast='high'] .a11y-section summary {
+    color: #aaaaaa;
+  }
+
+  .reader-content[data-klaro-contrast='high'] .a11y-body {
+    border-top-color: #555555;
+  }
+
+  .reader-content[data-klaro-contrast='high'] .a11y-body :global(a) {
+    color: #ffff00;
   }
 </style>

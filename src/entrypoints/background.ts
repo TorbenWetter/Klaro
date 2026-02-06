@@ -4,14 +4,14 @@ export default defineBackground(() => {
   browser.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
   // Notify side panel when the active tab changes
-  browser.tabs.onActivated.addListener((_activeInfo) => {
-    browser.runtime.sendMessage({ type: 'TAB_CHANGED' }).catch(() => {});
+  browser.tabs.onActivated.addListener((activeInfo) => {
+    browser.runtime.sendMessage({ type: 'TAB_CHANGED', tabId: activeInfo.tabId }).catch(() => {});
   });
 
   // Notify side panel when a tab finishes loading (navigation)
-  browser.tabs.onUpdated.addListener((_tabId, changeInfo, _tab) => {
+  browser.tabs.onUpdated.addListener((tabId, changeInfo, _tab) => {
     if (changeInfo.status === 'complete') {
-      browser.runtime.sendMessage({ type: 'TAB_CHANGED' }).catch(() => {});
+      browser.runtime.sendMessage({ type: 'TAB_CHANGED', tabId }).catch(() => {});
     }
   });
 

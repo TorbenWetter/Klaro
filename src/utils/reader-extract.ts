@@ -12,6 +12,7 @@ export interface ReaderContent {
   content: string;
   textContent: string;
   siteName: string | null;
+  a11yContent: string | null;
 }
 
 const MAX_NODES = 50_000;
@@ -87,18 +88,25 @@ const INLINE_TAGS = new Set([
 ]);
 
 /** Tags that are transparent — emit children only */
-const TRANSPARENT_TAGS = new Set([
-  'section',
-  'article',
-  'aside',
-  'header',
-  'footer',
-  'main',
-  'nav',
-  'form',
-  'fieldset',
-  'label',
+const TRANSPARENT_TAGS = new Set(['section', 'article', 'main', 'form', 'fieldset', 'label']);
+
+/** ARIA roles that indicate noise / non-content regions */
+const NOISE_ROLES = new Set([
+  'navigation',
+  'complementary',
+  'banner',
+  'contentinfo',
+  'dialog',
+  'alertdialog',
 ]);
+
+/** Class/ID patterns that indicate noise elements */
+const NOISE_PATTERN =
+  /\b(cookie|consent|gdpr|modal|popup|newsletter|subscribe|advertisement|advert|ad-slot|sidebar|widget|social-share|share-bar|comments?-section|comment-form|related-posts)\b/i;
+
+/** Class patterns that indicate screen-reader-only / visually-hidden elements */
+const SR_ONLY_PATTERN =
+  /\b(sr-only|visually-hidden|screen-reader-text|screen-reader-only|a11y-hidden|clip-hide|screenreader)\b/i;
 
 /** Lazy-load data attributes for images */
 const LAZY_ATTRS = ['data-src', 'data-lazy-src', 'data-original'];
@@ -129,6 +137,39 @@ function isHidden(el: HTMLElement): boolean {
     return true;
   }
   return false;
+}
+
+function isVisuallyHidden(el: HTMLElement): boolean {
+  // Cheap check: class name matches common sr-only patterns
+  const className = el.className;
+  if (typeof className === 'string' && SR_ONLY_PATTERN.test(className)) return true;
+
+  // Layout check: tiny bounding rect with clip-based hiding
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 1 && rect.height <= 1) {
+    const style = getComputedStyle(el);
+    if (style.overflow === 'hidden' || style.clip !== 'auto' || style.clipPath !== 'none') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isNoiseElement(el: HTMLElement): boolean {
+  const role = el.getAttribute('role');
+  if (role && NOISE_ROLES.has(role)) return true;
+  const className = el.className;
+  const id = el.id;
+  if (typeof className === 'string' && NOISE_PATTERN.test(className)) return true;
+  if (id && NOISE_PATTERN.test(id)) return true;
+  return false;
+}
+
+function hasSubstantialText(el: HTMLElement): boolean {
+  if (el.querySelector('h1, h2, h3, h4, h5, h6')) return true;
+  const text = el.textContent || '';
+  return text.trim().length > 50;
 }
 
 function resolveUrl(url: string, baseUrl: string): string {
@@ -216,6 +257,8 @@ function hasInlineBackground(el: HTMLElement): string | null {
 class DomWalker {
   private parts: string[] = [];
   private textParts: string[] = [];
+  private a11yParts: string[] = [];
+  private a11yTextParts: string[] = [];
   private nodeCount = 0;
   private baseUrl: string;
   private truncated = false;
@@ -269,6 +312,30 @@ class DomWalker {
     // Visibility check (skip hidden elements)
     if (isHidden(el)) return;
 
+    // Visually-hidden a11y elements: redirect output to the a11y accumulators
+    if (isVisuallyHidden(el)) {
+      const savedParts = this.parts;
+      const savedTextParts = this.textParts;
+      this.parts = this.a11yParts;
+      this.textParts = this.a11yTextParts;
+      this.walkChildren(el);
+      this.parts = savedParts;
+      this.textParts = savedTextParts;
+      return;
+    }
+
+    // Noise filtering — tag checks first so header/footer get hasSubstantialText
+    // regardless of their ARIA role (banner/contentinfo are implicit roles)
+    if (tag === 'nav') return;
+    if (tag === 'aside') return;
+    if (tag === 'header' || tag === 'footer') {
+      if (hasSubstantialText(el)) {
+        this.walkChildren(el);
+      }
+      return;
+    }
+    if (isNoiseElement(el)) return;
+
     // Image
     if (tag === 'img') {
       this.handleImg(el as HTMLImageElement);
@@ -296,7 +363,7 @@ class DomWalker {
 
     // Interactive elements
     if (tag === 'button') {
-      const text = el.textContent?.trim();
+      const text = el.innerText?.trim();
       if (text) {
         this.parts.push(`<strong>[${escapeHtml(text)}]</strong>`);
         this.textParts.push(`[${text}]`);
@@ -492,6 +559,14 @@ class DomWalker {
   getTextContent(): string {
     return this.textParts.join(' ');
   }
+
+  getA11yHtml(): string {
+    return this.a11yParts.join('');
+  }
+
+  getA11yTextContent(): string {
+    return this.a11yTextParts.join(' ');
+  }
 }
 
 function extractTitle(): string {
@@ -538,10 +613,67 @@ function extractByline(): string | null {
   return null;
 }
 
+function isImageNode(node: Node): node is HTMLImageElement {
+  return node.nodeType === Node.ELEMENT_NODE && (node as Element).tagName === 'IMG';
+}
+
+function isWhitespaceText(node: Node): boolean {
+  return node.nodeType === Node.TEXT_NODE && !node.textContent?.trim();
+}
+
+/**
+ * Wrap runs of 2+ consecutive <img> elements into a
+ * <div class="img-row"> for horizontal scrollable display.
+ * Recurses into block-level children.
+ */
+function groupConsecutiveImages(container: Element): void {
+  // Recurse into block-level children first
+  for (const child of container.querySelectorAll(
+    'div, section, article, main, figure, blockquote, li, td, th, details'
+  )) {
+    groupConsecutiveImages(child);
+  }
+
+  // Collect runs of consecutive images at this level
+  const children = Array.from(container.childNodes);
+  let i = 0;
+  while (i < children.length) {
+    if (!isImageNode(children[i])) {
+      i++;
+      continue;
+    }
+    // Found an image — scan ahead for more (skipping whitespace text nodes)
+    const run: HTMLImageElement[] = [children[i] as HTMLImageElement];
+    let j = i + 1;
+    while (j < children.length) {
+      if (isImageNode(children[j])) {
+        run.push(children[j] as HTMLImageElement);
+        j++;
+      } else if (isWhitespaceText(children[j])) {
+        j++;
+      } else {
+        break;
+      }
+    }
+    if (run.length >= 2) {
+      const row = document.createElement('div');
+      row.className = 'img-row';
+      container.insertBefore(row, run[0]);
+      for (const img of run) {
+        row.appendChild(img);
+      }
+      // Remove leftover whitespace text nodes between the images
+      // (they were skipped during scan but are now orphaned)
+    }
+    i = j;
+  }
+}
+
 /**
  * Post-process the generated HTML:
  * - Strip empty elements
  * - Resolve remaining relative URLs
+ * - Group consecutive images into scrollable rows
  * - Add target/rel to links
  */
 function postProcess(html: string, baseUrl: string): string {
@@ -569,6 +701,9 @@ function postProcess(html: string, baseUrl: string): string {
       }
     }
   }
+
+  // Group consecutive <img> elements into scrollable rows
+  groupConsecutiveImages(container);
 
   // Ensure all links have target and rel
   for (const a of container.querySelectorAll('a[href]')) {
@@ -603,11 +738,15 @@ export function extractReaderContent(): ReaderContent | null {
   const content = postProcess(rawHtml, baseUrl);
   if (!content.trim()) return null;
 
+  const rawA11yHtml = walker.getA11yHtml();
+  const a11yContent = rawA11yHtml.trim() ? postProcess(rawA11yHtml, baseUrl) : null;
+
   return {
     title: extractTitle(),
     byline: extractByline(),
     content,
     textContent: walker.getTextContent(),
     siteName: extractSiteName(),
+    a11yContent,
   };
 }
