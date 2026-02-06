@@ -3,10 +3,12 @@
   import type {
     AccessibilityPreferences,
     FontSize,
+    ContrastMode,
+    SpacingLevel,
   } from '../../../utils/accessibility-preferences';
   import {
     DEFAULT_PREFERENCES,
-    applyPreferencesToDOM,
+    FONT_SIZES,
     savePreferences,
     setOnboardingComplete,
   } from '../../../utils/accessibility-preferences';
@@ -17,17 +19,13 @@
 
   let { onComplete }: Props = $props();
 
-  // Current step (0-indexed)
   let step = $state(0);
-
-  // Preferences being configured
   let preferences = $state<AccessibilityPreferences>({ ...DEFAULT_PREFERENCES });
 
-  // Steps configuration
   const steps = [
     { id: 'welcome', title: 'Welcome to Klaro' },
     { id: 'fontSize', title: 'Which text size do you prefer?' },
-    { id: 'spacing', title: 'Which letter spacing do you prefer?' },
+    { id: 'spacing', title: 'Which spacing do you prefer?' },
     { id: 'contrast', title: 'Which contrast do you prefer?' },
     { id: 'complete', title: "You're all set!" },
   ];
@@ -37,23 +35,31 @@
   const isFirstStep = $derived(step === 0);
   const isLastStep = $derived(step === totalSteps - 1);
 
-  // Font size options
-  const fontSizeOptions: { value: FontSize; label: string; multiplier: string }[] = [
-    { value: 'medium', label: 'Normal Size', multiplier: '1x' },
-    { value: 'large', label: 'Large Size', multiplier: '1.2x' },
-    { value: 'xlarge', label: 'Huge Size', multiplier: '1.5x' },
+  const fontSizeOptions: { value: FontSize; label: string }[] = [
+    { value: 'small', label: 'Small' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'large', label: 'Large' },
+    { value: 'xlarge', label: 'Huge' },
+  ];
+
+  const spacingOptions: { value: SpacingLevel; label: string; letterSpacing: string }[] = [
+    { value: 'normal', label: 'Normal', letterSpacing: 'normal' },
+    { value: 'comfortable', label: 'Comfortable', letterSpacing: '0.02em' },
+    { value: 'spacious', label: 'Spacious', letterSpacing: '0.05em' },
+  ];
+
+  const contrastOptions: { value: ContrastMode; label: string }[] = [
+    { value: 'normal', label: 'Normal' },
+    { value: 'high', label: 'High' },
+    { value: 'inverted', label: 'Inverted' },
   ];
 
   function goBack(): void {
-    if (step > 0) {
-      step--;
-    }
+    if (step > 0) step--;
   }
 
   function goNext(): void {
-    if (step < totalSteps - 1) {
-      step++;
-    }
+    if (step < totalSteps - 1) step++;
   }
 
   async function finish(): Promise<void> {
@@ -64,44 +70,33 @@
 
   function selectFontSize(size: FontSize): void {
     preferences.fontSize = size;
-    applyPreferencesToDOM(preferences);
   }
 
-  function selectSpacing(increased: boolean): void {
-    preferences.increasedSpacing = increased;
-    applyPreferencesToDOM(preferences);
+  function selectSpacing(level: SpacingLevel): void {
+    preferences.spacingLevel = level;
   }
 
-  function selectContrast(high: boolean): void {
-    preferences.highContrast = high;
-    applyPreferencesToDOM(preferences);
+  function selectContrast(mode: ContrastMode): void {
+    preferences.contrastMode = mode;
   }
 </script>
 
 <div class="onboarding">
-  <!-- Main content area (white/light) -->
   <div class="content-area">
-    <!-- Step content -->
     <div class="step-content">
       {#if currentStep.id === 'welcome'}
-        <!-- Welcome Step -->
         <div class="welcome-step">
           <img src="/Klaro_Logo_Yellow.svg" alt="Klaro" class="logo" />
           <h1 class="title">Welcome to Klaro</h1>
           <p class="description">
-            Let's personalize your experience. We'll ask a few questions to make the sidebar easier
-            for you to use.
+            Let's personalize your reading experience. We'll ask a few questions to set up your
+            reader view.
           </p>
         </div>
       {:else if currentStep.id === 'fontSize'}
-        <!-- Font Size Step - title changes with selection -->
         <h1
           class="step-title"
-          style="font-size: {preferences.fontSize === 'medium'
-            ? '16px'
-            : preferences.fontSize === 'large'
-              ? '20px'
-              : '24px'}; transition: font-size 0.2s ease;"
+          style="font-size: {FONT_SIZES[preferences.fontSize]}px; transition: font-size 0.2s ease;"
         >
           {currentStep.title}
         </h1>
@@ -112,90 +107,66 @@
               class:selected={preferences.fontSize === option.value}
               onclick={() => selectFontSize(option.value)}
             >
-              <span
-                class="option-label"
-                style="font-size: {option.value === 'medium'
-                  ? '16px'
-                  : option.value === 'large'
-                    ? '20px'
-                    : '24px'}"
-              >
-                {option.label} ({option.multiplier})
+              <span class="option-label" style="font-size: {FONT_SIZES[option.value]}px">
+                {option.label}
               </span>
             </button>
           {/each}
         </div>
       {:else if currentStep.id === 'spacing'}
-        <!-- Spacing Step - title changes with selection -->
         <h1
           class="step-title"
-          style="letter-spacing: {preferences.increasedSpacing
-            ? '0.1em'
-            : 'normal'}; transition: letter-spacing 0.2s ease;"
+          style="letter-spacing: {spacingOptions.find((o) => o.value === preferences.spacingLevel)
+            ?.letterSpacing ?? 'normal'}; transition: letter-spacing 0.2s ease;"
         >
           {currentStep.title}
         </h1>
         <div class="options">
-          <button
-            class="option-pill"
-            class:selected={!preferences.increasedSpacing}
-            onclick={() => selectSpacing(false)}
-          >
-            <span class="option-label">Normal Spacing</span>
-          </button>
-          <button
-            class="option-pill"
-            class:selected={preferences.increasedSpacing}
-            onclick={() => selectSpacing(true)}
-          >
-            <span class="option-label" style="letter-spacing: 0.1em;">Increased Spacing</span>
-          </button>
+          {#each spacingOptions as option}
+            <button
+              class="option-pill"
+              class:selected={preferences.spacingLevel === option.value}
+              onclick={() => selectSpacing(option.value)}
+            >
+              <span class="option-label" style="letter-spacing: {option.letterSpacing};">
+                {option.label}
+              </span>
+            </button>
+          {/each}
         </div>
       {:else if currentStep.id === 'contrast'}
-        <!-- Contrast Step - background changes with selection -->
         <div
           class="contrast-preview-area"
-          class:high-contrast={preferences.highContrast}
-          style="transition: background-color 0.2s ease, color 0.2s ease;"
+          class:high-contrast={preferences.contrastMode === 'high'}
+          class:inverted-contrast={preferences.contrastMode === 'inverted'}
+          style="transition: background-color 0.2s ease, color 0.2s ease, filter 0.2s ease;"
         >
           <h1 class="step-title contrast-title">{currentStep.title}</h1>
           <div class="options">
-            <button
-              class="option-pill"
-              class:selected={!preferences.highContrast}
-              class:contrast-pill={true}
-              onclick={() => selectContrast(false)}
-            >
-              <svg class="option-icon" viewBox="0 0 32 32" fill="none">
-                <circle cx="16" cy="16" r="11" stroke="currentColor" stroke-width="2" fill="none" />
-              </svg>
-              <span class="option-label">Normal Contrast</span>
-            </button>
-            <button
-              class="option-pill"
-              class:selected={preferences.highContrast}
-              class:contrast-pill={true}
-              onclick={() => selectContrast(true)}
-            >
-              <svg class="option-icon" viewBox="0 0 32 32" fill="none">
-                <circle cx="16" cy="16" r="10" fill="currentColor" />
-              </svg>
-              <span class="option-label">High Contrast</span>
-            </button>
+            {#each contrastOptions as option}
+              <button
+                class="option-pill"
+                class:selected={preferences.contrastMode === option.value}
+                class:contrast-pill={true}
+                onclick={() => selectContrast(option.value)}
+              >
+                <span class="option-label">{option.label}</span>
+              </button>
+            {/each}
           </div>
         </div>
       {:else if currentStep.id === 'complete'}
-        <!-- Complete Step -->
         <div class="complete-step">
-          <div class="checkmark">✓</div>
+          <div class="checkmark">&#10003;</div>
           <h1 class="title">{currentStep.title}</h1>
-          <p class="description">Your preferences have been saved. You can change them anytime.</p>
+          <p class="description">
+            Your reading preferences have been saved. Tap the gear icon anytime to adjust them.
+          </p>
         </div>
       {/if}
     </div>
   </div>
 
-  <!-- Footer (dark bar) -->
   <div class="footer">
     {#if !isFirstStep}
       <button class="nav-btn" onclick={goBack}>
@@ -227,7 +198,6 @@
     background: #ffffff;
   }
 
-  /* Content area (white background) */
   .content-area {
     flex: 1;
     display: flex;
@@ -235,7 +205,6 @@
     overflow: hidden;
   }
 
-  /* Step content */
   .step-content {
     flex: 1;
     display: flex;
@@ -245,7 +214,6 @@
     padding: 24px;
   }
 
-  /* When contrast step, remove padding so preview area fills */
   .step-content:has(.contrast-preview-area) {
     padding: 0;
   }
@@ -258,7 +226,6 @@
     margin-bottom: 48px;
   }
 
-  /* Welcome step */
   .welcome-step,
   .complete-step {
     display: flex;
@@ -288,7 +255,6 @@
     line-height: 1.5;
   }
 
-  /* Options list */
   .options {
     display: flex;
     flex-direction: column;
@@ -297,7 +263,6 @@
     max-width: 280px;
   }
 
-  /* Pill-shaped option buttons */
   .option-pill {
     display: flex;
     align-items: center;
@@ -325,18 +290,12 @@
     color: #000000;
   }
 
-  .option-icon {
-    width: 24px;
-    height: 24px;
-    flex-shrink: 0;
-  }
-
   .option-label {
     font-weight: 500;
     white-space: nowrap;
   }
 
-  /* Contrast preview area - changes background with selection */
+  /* Contrast preview area */
   .contrast-preview-area {
     display: flex;
     flex-direction: column;
@@ -346,11 +305,15 @@
     height: 100%;
     padding: 24px;
     background: #ffffff;
-    border-radius: 0;
   }
 
   .contrast-preview-area.high-contrast {
     background: #000000;
+  }
+
+  .contrast-preview-area.inverted-contrast {
+    background: #1a1a1a;
+    filter: invert(1) hue-rotate(180deg);
   }
 
   .contrast-preview-area .step-title {
@@ -391,7 +354,6 @@
     color: #ffffff;
   }
 
-  /* Complete step */
   .checkmark {
     width: 64px;
     height: 64px;
@@ -406,7 +368,6 @@
     margin-bottom: 8px;
   }
 
-  /* Footer (dark bar) */
   .footer {
     display: flex;
     justify-content: space-between;

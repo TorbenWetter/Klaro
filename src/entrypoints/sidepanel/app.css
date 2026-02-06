@@ -1,12 +1,12 @@
-@import "tailwindcss";
+@import 'tailwindcss';
 
-@import "tw-animate-css";
+@import 'tw-animate-css';
 
 @custom-variant dark (&:is(.dark *));
 
 /* Klaro brand yellow #E9FF70 as accent only (borders, ring) — main UI stays neutral */
 :root {
-  --brand: #E9FF70;
+  --brand: #e9ff70;
   --brand-foreground: oklch(0.208 0.042 265.755);
   --radius: 0.625rem;
   --background: oklch(1 0 0);
@@ -43,7 +43,7 @@
 }
 
 .dark {
-  --brand: #E9FF70;
+  --brand: #e9ff70;
   --brand-foreground: oklch(0.208 0.042 265.755);
   --background: oklch(0.129 0.042 264.695);
   --foreground: oklch(0.984 0.003 247.858);
@@ -125,29 +125,10 @@
   body {
     @apply bg-background text-foreground;
   }
-}
-
-/* Klaro accessibility settings */
-:root {
-  --klaro-font-size: 16px;
-  --klaro-line-height: 1.5;
-  --klaro-letter-spacing: normal;
-}
-
-/* High contrast mode */
-.high-contrast {
-  --background: oklch(0 0 0);
-  --foreground: oklch(1 0 0);
-  --card: oklch(0.1 0 0);
-  --card-foreground: oklch(1 0 0);
-  --muted-foreground: oklch(0.85 0 0);
-  --border: oklch(1 0 0);
-}
-
-/* Reduced motion */
-.reduced-motion,
-.reduced-motion * {
-  animation-duration: 0.001ms !important;
-  animation-iteration-count: 1 !important;
-  transition-duration: 0.001ms !important;
+  html,
+  body,
+  #app {
+    height: 100%;
+    overflow: hidden;
+  }
 }

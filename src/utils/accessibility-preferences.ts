@@ -2,7 +2,7 @@
  * Accessibility Preferences
  *
  * Single source of truth for accessibility settings.
- * Used by: LLM prompts, TreeView/TreeNode styling, CSS classes, onboarding flow.
+ * Used by: side panel reader view, onboarding flow.
  */
 
 // =============================================================================
@@ -10,11 +10,13 @@
 // =============================================================================
 
 export type FontSize = 'small' | 'medium' | 'large' | 'xlarge';
+export type ContrastMode = 'normal' | 'high' | 'inverted';
+export type SpacingLevel = 'normal' | 'comfortable' | 'spacious';
 
 export interface AccessibilityPreferences {
   fontSize: FontSize;
-  highContrast: boolean;
-  increasedSpacing: boolean;
+  contrastMode: ContrastMode;
+  spacingLevel: SpacingLevel;
   reducedMotion: boolean;
 }
 
@@ -23,68 +25,22 @@ export interface AccessibilityPreferences {
 // =============================================================================
 
 export const DEFAULT_PREFERENCES: AccessibilityPreferences = {
-  fontSize: 'large', // Larger text for readability
-  highContrast: false, // Off by default, user can enable
-  increasedSpacing: true, // Easier scanning
-  reducedMotion: true, // Less distraction
+  fontSize: 'large',
+  contrastMode: 'normal',
+  spacingLevel: 'comfortable',
+  reducedMotion: true,
 };
 
 // =============================================================================
-// Font Size Values
+// Font Size Values (px for reader view)
 // =============================================================================
 
-const FONT_SIZE_PX: Record<FontSize, string> = {
-  small: '14px',
-  medium: '16px',
-  large: '18px',
-  xlarge: '20px',
+export const FONT_SIZES: Record<FontSize, number> = {
+  small: 16,
+  medium: 18,
+  large: 21,
+  xlarge: 25,
 };
-
-const FONT_SIZE_MULTIPLIERS: Record<FontSize, number> = {
-  small: 0.875,
-  medium: 1,
-  large: 1.125,
-  xlarge: 1.25,
-};
-
-/**
- * Apply font size preference to a base size
- */
-export function applyFontSize(baseSize: number, prefs: AccessibilityPreferences): number {
-  return baseSize * FONT_SIZE_MULTIPLIERS[prefs.fontSize];
-}
-
-/**
- * Get spacing multiplier based on preferences
- */
-export function getSpacingMultiplier(prefs: AccessibilityPreferences): number {
-  return prefs.increasedSpacing ? 1.5 : 1;
-}
-
-// =============================================================================
-// DOM Application
-// =============================================================================
-
-/**
- * Apply preferences to the DOM via CSS classes and custom properties.
- * Call this when preferences change or on initial load.
- */
-export function applyPreferencesToDOM(prefs: AccessibilityPreferences): void {
-  const root = document.documentElement;
-
-  // Font size
-  root.style.setProperty('--klaro-font-size', FONT_SIZE_PX[prefs.fontSize]);
-
-  // Line height and letter spacing based on increased spacing
-  root.style.setProperty('--klaro-line-height', prefs.increasedSpacing ? '1.8' : '1.5');
-  root.style.setProperty('--klaro-letter-spacing', prefs.increasedSpacing ? '0.02em' : 'normal');
-
-  // High contrast mode
-  root.classList.toggle('high-contrast', prefs.highContrast);
-
-  // Reduced motion
-  root.classList.toggle('reduced-motion', prefs.reducedMotion);
-}
 
 // =============================================================================
 // Storage (browser.storage.local)
@@ -93,9 +49,6 @@ export function applyPreferencesToDOM(prefs: AccessibilityPreferences): void {
 const STORAGE_KEY = 'klaroAccessibilityPreferences';
 const ONBOARDING_KEY = 'klaroOnboardingComplete';
 
-/**
- * Check if onboarding has been completed.
- */
 export async function isOnboardingComplete(): Promise<boolean> {
   try {
     if (typeof browser !== 'undefined' && browser.storage?.local) {
@@ -108,9 +61,6 @@ export async function isOnboardingComplete(): Promise<boolean> {
   return false;
 }
 
-/**
- * Mark onboarding as complete.
- */
 export async function setOnboardingComplete(): Promise<void> {
   try {
     if (typeof browser !== 'undefined' && browser.storage?.local) {
@@ -123,14 +73,15 @@ export async function setOnboardingComplete(): Promise<void> {
 
 /**
  * Load preferences from browser storage.
- * Returns defaults if not found or if running outside extension context.
+ * Handles backward-compat migration from older preference formats.
  */
 export async function loadPreferences(): Promise<AccessibilityPreferences> {
   try {
     if (typeof browser !== 'undefined' && browser.storage?.local) {
       const result = await browser.storage.local.get(STORAGE_KEY);
       if (result[STORAGE_KEY]) {
-        currentPreferences = { ...DEFAULT_PREFERENCES, ...result[STORAGE_KEY] };
+        const stored = result[STORAGE_KEY] as Record<string, unknown>;
+        currentPreferences = migratePreferences(stored);
         return currentPreferences;
       }
     }
@@ -140,12 +91,8 @@ export async function loadPreferences(): Promise<AccessibilityPreferences> {
   return DEFAULT_PREFERENCES;
 }
 
-/**
- * Save preferences to browser storage.
- */
 export async function savePreferences(prefs: AccessibilityPreferences): Promise<void> {
   currentPreferences = prefs;
-  applyPreferencesToDOM(prefs);
 
   try {
     if (typeof browser !== 'undefined' && browser.storage?.local) {
@@ -157,6 +104,46 @@ export async function savePreferences(prefs: AccessibilityPreferences): Promise<
 }
 
 // =============================================================================
+// Migration
+// =============================================================================
+
+function migratePreferences(stored: Record<string, unknown>): AccessibilityPreferences {
+  const base = { ...DEFAULT_PREFERENCES };
+
+  if (
+    stored.fontSize &&
+    ['small', 'medium', 'large', 'xlarge'].includes(stored.fontSize as string)
+  ) {
+    base.fontSize = stored.fontSize as FontSize;
+  }
+  if (
+    stored.contrastMode &&
+    ['normal', 'high', 'inverted'].includes(stored.contrastMode as string)
+  ) {
+    base.contrastMode = stored.contrastMode as ContrastMode;
+  }
+  if (
+    stored.spacingLevel &&
+    ['normal', 'comfortable', 'spacious'].includes(stored.spacingLevel as string)
+  ) {
+    base.spacingLevel = stored.spacingLevel as SpacingLevel;
+  }
+  if (typeof stored.reducedMotion === 'boolean') base.reducedMotion = stored.reducedMotion;
+
+  // v1 backward-compat: highContrast → contrastMode
+  if (typeof stored.highContrast === 'boolean' && !stored.contrastMode) {
+    base.contrastMode = stored.highContrast ? 'high' : 'normal';
+  }
+
+  // v1 backward-compat: increasedSpacing → spacingLevel
+  if (typeof stored.increasedSpacing === 'boolean' && !stored.spacingLevel) {
+    base.spacingLevel = stored.increasedSpacing ? 'comfortable' : 'normal';
+  }
+
+  return base;
+}
+
+// =============================================================================
 // Current Preferences (in-memory state)
 // =============================================================================
 
@@ -164,9 +151,4 @@ let currentPreferences = DEFAULT_PREFERENCES;
 
 export function getPreferences(): AccessibilityPreferences {
   return currentPreferences;
-}
-
-export function setPreferences(prefs: Partial<AccessibilityPreferences>): void {
-  currentPreferences = { ...currentPreferences, ...prefs };
-  applyPreferencesToDOM(currentPreferences);
 }
