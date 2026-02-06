@@ -139,7 +139,7 @@
     border-bottom-color: #444444;
   }
 
-  /* Readability HTML content styles */
+  /* Extracted content styles */
   .body :global(p) {
     margin: 0 0 1em;
   }
@@ -164,16 +164,17 @@
   }
 
   .body :global(img) {
-    max-width: 100%;
+    max-width: 40%;
     height: auto;
     border-radius: 4px;
-    margin: 1em 0;
+    margin: 0.75em 0;
   }
 
   .body :global(a) {
     color: #1a5fb4;
     text-decoration: underline;
     text-underline-offset: 2px;
+    margin-right: 0.4em;
   }
 
   .body :global(a:hover) {
@@ -267,5 +268,65 @@
 
   .reader-content[data-klaro-contrast='high'] .body :global(hr) {
     border-top-color: #444444;
+  }
+
+  /* Details/Summary */
+  .body :global(details) {
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    padding: 0.5em 0.75em;
+    margin: 1em 0;
+  }
+
+  .reader-content[data-klaro-contrast='high'] .body :global(details) {
+    border-color: #555555;
+  }
+
+  .body :global(summary) {
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  /* Definition Lists */
+  .body :global(dl) {
+    margin: 1em 0;
+  }
+
+  .body :global(dt) {
+    font-weight: 700;
+    margin-top: 0.5em;
+  }
+
+  .body :global(dd) {
+    margin-left: 1.5em;
+    margin-bottom: 0.5em;
+  }
+
+  /* Mark (highlight) */
+  .body :global(mark) {
+    background: #fff3b0;
+    padding: 0.1em 0.2em;
+    border-radius: 2px;
+  }
+
+  .reader-content[data-klaro-contrast='high'] .body :global(mark) {
+    background: #665500;
+    color: #ffffff;
+  }
+
+  /* Keyboard key */
+  .body :global(kbd) {
+    background: #f5f5f5;
+    border: 1px solid #cccccc;
+    border-radius: 3px;
+    padding: 0.1em 0.4em;
+    font-size: 0.85em;
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  }
+
+  .reader-content[data-klaro-contrast='high'] .body :global(kbd) {
+    background: #333333;
+    border-color: #666666;
+    color: #ffffff;
   }
 </style>

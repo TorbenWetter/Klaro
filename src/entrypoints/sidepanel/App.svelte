@@ -149,7 +149,7 @@
         <div class="error-state">
           <p class="text-lg font-medium">Could not extract content</p>
           <p class="text-sm text-muted-foreground">
-            Try a news article or blog post for best results.
+            This page may be empty or restricted. Try reloading the page.
           </p>
           <Button variant="outline" size="sm" onclick={extractContent} class="mt-4">
             <RotateCw size={16} class="mr-2" />
